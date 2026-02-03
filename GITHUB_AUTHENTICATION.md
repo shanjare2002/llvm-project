@@ -78,8 +78,11 @@ git config --global credential.helper osxkeychain
 
 #### On Windows:
 ```bash
-# Use Windows Credential Manager
-git config --global credential.helper manager
+# Use Windows Credential Manager (Git Credential Manager is installed by default with Git for Windows)
+git config --global credential.helper wincred
+
+# Or if using Git Credential Manager (recommended, usually pre-configured)
+git config --global credential.helper manager-core
 ```
 
 ### Option 3: Use Personal Access Token in Remote URL
