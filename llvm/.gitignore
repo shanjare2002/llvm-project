@@ -37,6 +37,7 @@ autoconf/autom4te.cache
 /CMakeLists.txt.user
 /clang-build/
 build/
+.github
 
 #==============================================================================#
 # Directories to ignore (do not add trailing '/'s, they skip symlinks).

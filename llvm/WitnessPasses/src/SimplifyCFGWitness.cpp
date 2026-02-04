@@ -570,7 +570,8 @@ static bool iterativelySimplifyCFG(
       }
 
       // Track the block's single predecessor before simplification
-      BasicBlock *Pred = BB->getSinglePredecessor();
+      BasicBlock *Pgit remote -v
+red = BB->getSinglePredecessor();
 
       if (witness::simplifyCFG(BB, TTI, DTU, Options, LoopHeaders, blockMap)) {
         LocalChange = true;
