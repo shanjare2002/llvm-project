@@ -1,0 +1,221 @@
+// STATE PRESERVATION AND BLOCK MAPPING EXPLANATION
+// =====================================================
+
+/*
+STATE PRESERVATION IN BLOCK MAPPINGS
+=====================================
+
+The key insight is that when SimplifyCFG collapses blocks, the symbolic STATE
+at each corresponding point must remain EQUIVALENT between source and target.
+
+TWO TYPES OF MAPPINGS:
+1. MANY-TO-ONE (Collapsed blocks)
+2. ONE-TO-ONE (Preserved blocks)
+
+---
+
+EXAMPLE: PARTIAL COLLAPSE
+
+Source Program (Before SimplifyCFG):
+┌─────────────────────────────────────┐
+│ entry (block 0)                     │
+│ if (x > 100) goto large_value       │
+│ else goto small_check               │
+└─────────────────────────────────────┘
+       ↙              ↖
+    (x≤100)        (x>100)
+    /                    \
+┌─────────┐        ┌──────────────┐
+│small_   │        │large_value   │
+│check    │        │(x*x*x) + 1   │
+│if x>0   │        └──────────────┘
+└─────────┘              │
+ ↙       ↖               │
+/         \              │
+┌──────────┐ ┌──────────────┐
+│positive  │ │nonpositive   │
+│y = 10    │ │y = 10        │ ← SAME VALUE!
+└──────────┘ └──────────────┘
+ │            │
+ └────┬───────┘
+      ↓
+┌──────────────────┐
+│merge_small       │
+│result = y * x    │
+└──────────────────┘
+      │
+      └─────────────┐
+                    │
+              ┌─────────────┐
+              │exit         │
+              │return result│
+              └─────────────┘
+
+
+Target Program (After SimplifyCFG):
+┌─────────────────────────────────────┐
+│ entry (block 0)                     │
+│ if (x > 100) goto large_value       │
+│ else goto small_collapsed           │
+└─────────────────────────────────────┘
+       ↙              ↖
+    (x≤100)        (x>100)
+    /                    \
+┌──────────────────┐   ┌──────────────┐
+│small_collapsed   │   │large_value   │
+│y = 10            │   │(x*x*x) + 1   │
+│result = y * x    │   └──────────────┘
+│(no branch!)      │        │
+└──────────────────┘        │
+      │                     │
+      └─────────┬───────────┘
+                ↓
+         ┌─────────────┐
+         │exit         │
+         │return result│
+         └─────────────┘
+
+BLOCK MAPPING (Source → Target):
+  entry             (0) → entry           (0)   [1:1 preserved]
+  small_check       (1) → small_collapsed (1)   [many:1 collapsed]
+  positive          (2) → small_collapsed (1)   [many:1 collapsed]
+  nonpositive       (3) → small_collapsed (1)   [many:1 collapsed]
+  merge_small       (4) → small_collapsed (1)   [many:1 collapsed]
+  large_value       (5) → large_value     (2)   [1:1 preserved]
+  exit              (6) → exit            (3)   [1:1 preserved]
+
+---
+
+STATE PRESERVATION RULES
+========================
+
+For each block mapping (source_block → target_block), we must verify:
+
+  PATH_CONDITION(source) ∧ PATH_CONDITION(target) ⟹ STATE_EQUIV
+
+This means: "If we can reach source_block and the target_block via their
+respective paths, then the symbolic states must be equivalent."
+
+---
+
+CASE 1: MANY-TO-ONE MAPPING (COLLAPSED)
+========================================
+
+Mapping: Blocks {small_check(1), positive(2), nonpositive(3), merge_small(4)} → small_collapsed(1)
+
+KEY OBSERVATION: Both positive and nonpositive compute the SAME value:
+  - positive_path: y = 10
+  - nonpositive_path: y = 10
+  
+So they can be merged into one block without losing information!
+
+STATE PRESERVATION for collapsed blocks:
+  
+  Input variables that are PRESERVED:
+    - x remains unchanged (input parameter)
+  
+  Computed variables that MUST MATCH:
+    - y_source = 10 must equal y_target = 10  ✓
+    - result_source = y * x must equal result_target = y * x  ✓
+
+Witness Condition (WitnessExprST):
+  (pi_S ∈ {1,2,3,4}) ∧ (pi_T = 1) ∧
+  (x_source == x_target) ∧
+  (y_source == y_target)  // Both are 10!
+
+This works because:
+  1. Multiple source blocks compute identical values (redundancy)
+  2. The optimized target block does the same computation
+  3. No information is lost
+
+
+CASE 2: ONE-TO-ONE MAPPING (PRESERVED)
+=======================================
+
+Mapping 1: entry(0) → entry(0)
+  - No computation, just a branch point
+  - Path condition: true → true  (always executed)
+  - State: Only input x exists
+  - Equivalence: trivial (x == x)
+
+Mapping 2: large_value(5) → large_value(2)
+  - DISTINCT computation (x³ + 1), not replaced
+  - Path condition: (x > 100) → (x > 100)
+  - State variables:
+    - x_source = x must equal x_target = x  ✓
+    - cubed_source = x³ must equal cubed_target = x³  ✓
+    - result_source = x³+1 must equal result_target = x³+1  ✓
+  
+  Witness Condition:
+    (pi_S = 5) ∧ (pi_T = 2) ∧
+    (cubed_source == cubed_target)
+
+Mapping 3: exit(6) → exit(3)
+  - No computation, just returns
+  - Path condition: true → true
+  - State: Only return result (inherited from predecessors)
+  - Equivalence: result_source == result_target
+
+---
+
+HOW STATE PRESERVATION PREVENTS BUGS
+====================================
+
+Why can't we always collapse blocks?
+
+BAD EXAMPLE (What we DON'T do):
+  Block A: x = 5, y = x * 2 = 10
+  Block B: x = 3, y = x * 2 = 6  
+  
+  These LOOK equivalent but aren't! Different computations.
+  If we collapse them, state is LOST.
+
+GOOD EXAMPLE (What we DO):
+  Block A: y = 10
+  Block B: y = 10
+  
+  Same computation, same result. Safe to collapse.
+  State is PRESERVED because output is identical.
+
+---
+
+STATE EQUIVALENCE PROOF STRUCTURE
+=================================
+
+For each equivalence point (source_path → target_path):
+
+  STATE_EQUIV = (input_vars_equal) ∧ (computed_vars_equal) ∧ (result_equal)
+
+For COLLAPSED blocks:
+  - Input: x is preserved (same value flows through)
+  - Computed: y = 10 in both (redundancy is key!)
+  - Result: y * x is the same formula in both
+
+For PRESERVED blocks:
+  - Input: x is preserved
+  - Computed: Different formulas but equivalent (x³+1 == x³+1)
+  - Result: Formulas match exactly
+
+Z3 VERIFICATION:
+  solver.add(¬(∀x: path_equivalence ∧ state_equivalence))
+  if (unsatisfiable) {
+    // ✓ All states preserved, optimization is correct
+  } else {
+    // ✗ Found counterexample where states differ
+  }
+
+---
+
+KEY INSIGHT
+===========
+
+Block mapping + State preservation = Proof of transformation correctness
+
+The witness relation ST encodes:
+  "For every source state reaching block B_s,
+   there exists a target state reaching block B_t such that
+   the symbolic values are equivalent."
+
+This ensures SimplifyCFG's block collapsing doesn't change the program's
+semantics, even though the structure is optimized.
+*/

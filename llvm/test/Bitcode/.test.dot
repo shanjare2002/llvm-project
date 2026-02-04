@@ -1,0 +1,16 @@
+digraph "CFG for 'test' function" {
+	label="CFG for 'test' function";
+
+	Node0x55724e6d5220 [shape=record,color="#b70d28ff", style=filled, fillcolor="#b70d2870" fontname="Courier",label="{entry:\l|  %cmp = icmp eq i32 %x, 0\l  br i1 %cmp, label %then, label %else\l|{<s0>T|<s1>F}}"];
+	Node0x55724e6d5220:s0 -> Node0x55724e6d5280;
+	Node0x55724e6d5220:s1 -> Node0x55724e6d57c0;
+	Node0x55724e6d5280 [shape=record,color="#3d50c3ff", style=filled, fillcolor="#c32e3170" fontname="Courier",label="{then:\l|  %z = mul i32 %x, 12\l  %cmp1 = icmp sgt i32 %z, 70\l  br i1 %cmp1, label %common.ret, label %bigger\l|{<s0>T|<s1>F}}"];
+	Node0x55724e6d5280:s0 -> Node0x55724e6d5760;
+	Node0x55724e6d5280:s1 -> Node0x55724e6d6090;
+	Node0x55724e6d57c0 [shape=record,color="#b70d28ff", style=filled, fillcolor="#bb1b2c70" fontname="Courier",label="{else:\l|  %z1 = mul i32 %x, 12\l  %cmp2 = icmp sgt i32 %z1, 70\l  br i1 %cmp2, label %common.ret, label %bigger\l|{<s0>T|<s1>F}}"];
+	Node0x55724e6d57c0:s0 -> Node0x55724e6d5760;
+	Node0x55724e6d57c0:s1 -> Node0x55724e6d6090;
+	Node0x55724e6d5760 [shape=record,color="#b70d28ff", style=filled, fillcolor="#b70d2870" fontname="Courier",label="{common.ret:\l|  %common.ret.op = phi i32 [ 50, %bigger ], [ 25, %else ], [ 25, %then ]\l  ret i32 %common.ret.op\l}"];
+	Node0x55724e6d6090 [shape=record,color="#3d50c3ff", style=filled, fillcolor="#be242e70" fontname="Courier",label="{bigger:\l|  br label %common.ret\l}"];
+	Node0x55724e6d6090 -> Node0x55724e6d5760;
+}

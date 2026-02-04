@@ -1,0 +1,199 @@
+// STATE CHECKING FOR MANY-TO-ONE BLOCK MAPPINGS
+// ==============================================
+
+/*
+IMPORTANT: Many-to-one blocks ARE state-checked!
+
+The difference is WHEN and WHERE the state checking happens.
+
+---
+
+ONE-TO-ONE BLOCKS: Per-Block State Checking
+============================================
+
+Structure: Source_Block → Target_Block (1:1)
+
+State checking happens AT EACH BLOCK:
+
+  Source: entry(0)     Target: entry(0)
+  State: x                State: x
+  VC: (path_src_entry ∧ path_tgt_entry) ⟹ (x_src == x_tgt) ✓
+
+  Source: large_value(5)   Target: large_value(2)
+  State: x, x³, result     State: x, x³, result
+  VC: (path_src_large ∧ path_tgt_large) ⟹ 
+      (x_src == x_tgt ∧ cubed_src == cubed_tgt) ✓
+
+Each block pair has its OWN state equivalence check.
+
+---
+
+MANY-TO-ONE BLOCKS: Merge-Point State Checking
+===============================================
+
+Structure: Source_Blocks {1,2,3,4} → Target_Block {1}
+
+State checking happens at the MERGE POINT (after collapse):
+
+In Source Program:
+  Block 1 (small_check): branch condition
+    ↙        ↖
+  Block 2    Block 3
+ (positive) (nonpositive)
+  y=10       y=10
+    ↓        ↓
+  Block 4 (merge_small)  ← STATE CHECKED HERE
+  result = y * x
+
+In Target Program:
+  Block 1 (small_collapsed)  ← STATE CHECKED HERE
+  y = 10 (no branch needed)
+  result = y * x
+
+KEY INSIGHT: We don't check state at blocks 1,2,3 individually.
+We check state at the MERGE POINT where all paths converge.
+
+Why? Because blocks 1,2,3 are not separate target blocks!
+They're merged into one block, so they're checked together.
+
+---
+
+STATE CHECKING LOGIC FOR COLLAPSED BLOCKS
+===========================================
+
+Code from SimplifyCFGWitness.cpp:
+
+```cpp
+// Collapsed blocks: small paths equivalent
+z3::expr state_equiv_small = (x_src_small == x_tgt_small) &&
+                             (y_src_small == y_tgt_small) &&
+                             (result_src_small == result_tgt_small);
+
+z3::expr state_vc_small = z3::implies(
+    path_src_merge_small && path_tgt_small_collapsed, 
+    state_equiv_small);
+```
+
+This checks:
+  - path_src_merge_small = (positive OR nonpositive)
+    (Can we reach merge_small from either source path?)
+  
+  - path_tgt_small_collapsed = (x <= 100)
+    (Can we reach small_collapsed in target?)
+  
+  - state_equiv_small:
+    (x_source == x_target) AND
+    (y_source == y_target)  [both are 10] AND
+    (result_source == result_target)  [both compute y*x]
+
+So the VC says:
+  "IF we can reach the merge point in source AND reach small_collapsed in target,
+   THEN their states must be equivalent."
+
+---
+
+WHY THIS WORKS
+==============
+
+The collapsed blocks are MERGED because they compute IDENTICAL RESULTS:
+
+Path analysis:
+  positive path:   y = 10, result = y * x = 10 * x
+  nonpositive path: y = 10, result = y * x = 10 * x
+  
+Both paths produce the SAME final state!
+
+So checking at the merge point is sufficient because:
+  1. All input states (x) are the same
+  2. Both source paths compute y = 10
+  3. Both source paths compute result = y * x
+  4. Therefore at merge_small, the state is deterministic
+
+Target:
+  1. Input state (x) is the same
+  2. Target computes y = 10 (same as both source paths)
+  3. Target computes result = y * x (same as both source paths)
+  4. Therefore at small_collapsed, the state matches
+
+---
+
+COMPARISON: State Checks for All Block Types
+=============================================
+
+Entry block (0→0):
+  State_Check: (path_src_entry ∧ path_tgt_entry) ⟹ (x_source == x_target)
+  Type: ONE-TO-ONE
+  Location: At entry block itself
+
+Positive block (2→1):
+  State_Check: NOT DONE individually
+  Merged into merge_small check
+  Type: MANY-TO-ONE (part of collapse)
+
+Nonpositive block (3→1):
+  State_Check: NOT DONE individually
+  Merged into merge_small check
+  Type: MANY-TO-ONE (part of collapse)
+
+Merge_small block (4→1):
+  State_Check: (path_src_merge_small ∧ path_tgt_small_collapsed) ⟹
+               (x_eq ∧ y_eq ∧ result_eq)
+  Type: COLLAPSE MERGE POINT
+  Location: At merge point (where all collapsed paths converge)
+
+Large_value block (5→2):
+  State_Check: (path_src_large ∧ path_tgt_large) ⟹
+               (x_eq ∧ cubed_eq ∧ result_eq)
+  Type: ONE-TO-ONE (preserved)
+  Location: At large_value block itself
+
+Exit block (6→3):
+  State_Check: (path_src_exit ∧ path_tgt_exit) ⟹ true
+  Type: ONE-TO-ONE
+  Location: At exit block itself
+
+---
+
+WITNESS RELATION FOR MANY-TO-ONE
+================================
+
+WitnessExprST (from SimplifyCFGWitness.cpp):
+
+Case 1: Collapsed blocks (1,2,3,4) → 1
+  witness_collapsed =
+    ((pi_S == 1 || pi_S == 2 || pi_S == 3 || pi_S == 4)) &&
+    (pi_T == 1) &&
+    (x_source == x_target) &&
+    (y_source == y_target)  // Both are 10!
+
+This witness says:
+  "If we're in any of the source collapsed blocks (1,2,3,4)
+   and we're in the target collapsed block (1),
+   then x and y must be the same."
+
+Key: The witness does NOT track which specific source block we're in.
+It treats {1,2,3,4} as a unit because they all:
+  - Have the same final values
+  - Map to the same target block
+  - Produce equivalent states
+
+---
+
+SUMMARY
+=======
+
+MANY-TO-ONE blocks ARE state-checked, but:
+  ✓ Not checked per-block
+  ✓ Checked at the MERGE POINT where they converge
+  ✓ Only needs to verify that the merged state is equivalent
+  ✓ Works because collapsed blocks compute identical values
+
+ONE-TO-ONE blocks ARE state-checked:
+  ✓ Checked per-block
+  ✓ Direct correspondence between source and target
+  ✓ Each block pair has its own VC
+
+The witness relation ST handles both cases:
+  - ONE-TO-ONE: (pi_S = i) ∧ (pi_T = j) ∧ (state_equiv_ij)
+  - MANY-TO-ONE: (pi_S ∈ {i,j,k,l}) ∧ (pi_T = m) ∧ (state_equiv_merged)
+*/
