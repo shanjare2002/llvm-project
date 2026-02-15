@@ -6,6 +6,11 @@ merge:
   %cmp = icmp slt i32 %x, 10
   br i1 %cmp, label %if_true, label %if_false
 
+if_cond:
+   ret i32 14
+dead_block:
+  ret i32 19
+
 if_true:
   %x1 = add i32 %x, 1
   ret i32 12
