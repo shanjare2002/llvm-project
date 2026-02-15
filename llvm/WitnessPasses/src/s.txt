@@ -1,0 +1,7 @@
+(=> (and true
+         (= x1_src (+ x 1))
+         (= common.ret.op_tgt 12)
+         (= ret_tgt common.ret.op_tgt)
+         (= x1_tgt (+ x 1))
+         (= x_src x_tgt))
+    (and (= x1_src x1_tgt)))

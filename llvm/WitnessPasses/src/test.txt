@@ -1,0 +1,11 @@
+(=> (and true (= cmp_src (< x 10)) (= x_src x) (= cmp_tgt (< x 10)) (= x_tgt x))
+    (and (= cmp_src cmp_tgt) (= x_src x_tgt)))
+ (=> (and true
+
+         (= x1_src (+ x 1))
+         (= common.ret.op_tgt 12)
+         (= ret_tgt common.ret.op_tgt)
+         (= x_tgt x)
+         (= x1_tgt (+ x 1)))
+         ()
+    (and (= x_src x_tgt) (= x1_src x1_tgt)))

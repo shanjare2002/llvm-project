@@ -9,8 +9,6 @@
 #include "CFGMappingWitness.h"
 #include "WitnessChecker.h"
 
-#include <map>
-
 struct SimplifyCFGWitness : public llvm::PassInfoMixin<SimplifyCFGWitness> {
 
   llvm::PreservedAnalyses run(llvm::Function &F,
@@ -19,7 +17,8 @@ struct SimplifyCFGWitness : public llvm::PassInfoMixin<SimplifyCFGWitness> {
 private:
   void generateWitness(
       llvm::Function &F, llvm::CFGMappingWitness &Witness,
-      llvm::DenseMap<llvm::BasicBlock *, llvm::BasicBlock *> &BlockMap);
+      llvm::DenseMap<llvm::BasicBlock *, llvm::BasicBlock *> &BlockMap,
+      z3::context &SymCtx);
 };
 
 #endif

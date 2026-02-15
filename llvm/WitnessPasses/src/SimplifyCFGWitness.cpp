@@ -227,11 +227,11 @@ static z3::expr makeFreshZ3Expr(const Value *V, z3::context &C) {
 }
 
 static z3::expr z3GetExprForValue(const Value *V, z3::context &C,
-                                  DenseMap<const Value *, z3::expr> &ValMap);
+                                  std::map<const Value *, z3::expr> &ValMap);
 
 static z3::expr
 computeInstructionExprZ3(const Instruction &I, z3::context &C,
-                         DenseMap<const Value *, z3::expr> &ValMap) {
+                         std::map<const Value *, z3::expr> &ValMap) {
   if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
     z3::expr L = z3GetExprForValue(BO->getOperand(0), C, ValMap);
     z3::expr R = z3GetExprForValue(BO->getOperand(1), C, ValMap);
@@ -308,7 +308,7 @@ computeInstructionExprZ3(const Instruction &I, z3::context &C,
 }
 
 static z3::expr z3GetExprForValue(const Value *V, z3::context &C,
-                                  DenseMap<const Value *, z3::expr> &ValMap) {
+                                  std::map<const Value *, z3::expr> &ValMap) {
   auto It = ValMap.find(V);
   if (It != ValMap.end())
     return It->second;
@@ -368,16 +368,16 @@ static void dumpBlockValueMap(Function &F, const char *Label) {
 }
 
 using Z3BlockMap =
-    DenseMap<const BasicBlock *, DenseMap<const Value *, z3::expr>>;
+    std::map<const BasicBlock *, std::map<const Value *, z3::expr>>;
 
 static Z3BlockMap buildBlockZ3ValueMap(Function &F, z3::context &C) {
   Z3BlockMap Result;
-  DenseMap<const Value *, z3::expr> GlobalMap;
+  std::map<const Value *, z3::expr> GlobalMap;
   for (Argument &A : F.args())
     GlobalMap.insert({&A, makeFreshZ3Expr(&A, C)});
 
   for (BasicBlock &BB : F) {
-    DenseMap<const Value *, z3::expr> LocalMap = GlobalMap;
+    std::map<const Value *, z3::expr> LocalMap = GlobalMap;
     for (Instruction &I : BB) {
       if (I.getType()->isVoidTy())
         continue;
@@ -570,8 +570,7 @@ static bool iterativelySimplifyCFG(
       }
 
       // Track the block's single predecessor before simplification
-      BasicBlock *Pgit remote -v
-red = BB->getSinglePredecessor();
+      BasicBlock *Pred = BB->getSinglePredecessor();
 
       if (witness::simplifyCFG(BB, TTI, DTU, Options, LoopHeaders, blockMap)) {
         LocalChange = true;
@@ -686,7 +685,10 @@ PreservedAnalyses SimplifyCFGWitness::run(Function &F,
 
   // Pass static CFGMappingWitness reference and blockMap to generateWitness
   CFGMappingWitness dummyWitness; // Placeholder since we use static methods
-  generateWitness(F, dummyWitness, blockMap);
+  generateWitness(F, dummyWitness, blockMap, SymCtx);
+
+  // Release Z3 expressions before SymCtx is destroyed.
+  CFGMappingWitness::clear();
 
   PreservedAnalyses PA;
   PA.preserve<DominatorTreeAnalysis>();
@@ -697,61 +699,35 @@ PreservedAnalyses SimplifyCFGWitness::run(Function &F,
 /// Uses explicit block mapping to verify transformation soundness
 void SimplifyCFGWitness::generateWitness(
     Function &F, CFGMappingWitness &CFGWitness,
-    DenseMap<BasicBlock *, BasicBlock *> &blockMap) {
+    DenseMap<BasicBlock *, BasicBlock *> &blockMap, z3::context &SymCtx) {
   errs() << "\n=== INTEGRATED SIMPLIFY-CFG WITNESS VALIDATION ===\n";
 
-  z3::context c;
+  z3::context &c = SymCtx;
   z3::solver solver(c);
-  z3::expr x = c.int_const("x");
-
-  // ==========================================================
-  // STEP 1: HARDCODED REACHABILITY CONDITIONS (Upsilon)
-  // Source: test1.ll, Target: new1.ll
-  // ==========================================================
-
-  // --- Source Reachability (test1.ll blocks) ---
-  z3::expr ups_src_entry = c.bool_val(true);
-  z3::expr ups_src_merge = c.bool_val(true); // Always reached from entry
-  z3::expr ups_src_if_true = (x < 10);       // Reached when cmp is true
-  z3::expr ups_src_if_false = !(x < 10);     // Reached when cmp is false
-
-  // --- Target Reachability (new1.ll blocks) ---
-  z3::expr ups_tgt_entry = c.bool_val(true);
-  z3::expr ups_tgt_if_true = (x < 10); // Reached when cmp is true (from entry)
-  z3::expr ups_tgt_if_false =
-      !(x < 10); // Reached when cmp is false (from entry)
-  z3::expr ups_tgt_common_ret =
-      c.bool_val(true); // Always reached (from either path)
-
-  // Map block names to their reachability conditions
-  SmallVector<std::pair<StringRef, z3::expr>, 4> src_conditions;
-  src_conditions.push_back({"entry", ups_src_entry});
-  src_conditions.push_back({"merge", ups_src_merge});
-  src_conditions.push_back({"if_true", ups_src_if_true});
-  src_conditions.push_back({"if_false", ups_src_if_false});
-
-  SmallVector<std::pair<StringRef, z3::expr>, 4> tgt_conditions;
-  tgt_conditions.push_back({"entry", ups_tgt_entry});
-  tgt_conditions.push_back({"if_true", ups_tgt_if_true});
-  tgt_conditions.push_back({"if_false", ups_tgt_if_false});
-  tgt_conditions.push_back({"common.ret", ups_tgt_common_ret});
+  z3::expr_vector forall_vars(c);
+  for (Argument &A : F.args()) {
+    if (A.getType()->isIntegerTy(1)) {
+      forall_vars.push_back(c.bool_const(A.getName().str().c_str()));
+    } else if (A.getType()->isIntegerTy()) {
+      forall_vars.push_back(c.int_const(A.getName().str().c_str()));
+    }
+  }
+  const auto &src_conditions = CFGMappingWitness::getSourcePathCondMap();
+  const auto &tgt_conditions = CFGMappingWitness::getTargetPathCondMap();
 
   auto lookup_src_cond = [&](StringRef name) {
-    for (auto &pair : src_conditions) {
-      if (pair.first == name)
-        return pair.second;
-    }
+    auto It = src_conditions.find(name.str());
+    if (It != src_conditions.end())
+      return It->second;
     return c.bool_val(false);
   };
 
   auto lookup_tgt_cond = [&](StringRef name) {
-    for (auto &pair : tgt_conditions) {
-      if (pair.first == name)
-        return pair.second;
-    }
+    auto It = tgt_conditions.find(name.str());
+    if (It != tgt_conditions.end())
+      return It->second;
     return c.bool_val(false);
   };
-
   // ==========================================================
   // STEP 2A: WITNESSED MAPPING (One-to-Many: Source -> Targets)
   // Each source block maps to one or more target blocks.
@@ -785,12 +761,22 @@ void SimplifyCFGWitness::generateWitness(
   DenseMap<StringRefVec, StringRefVec> many_to_many;
   DenseMap<StringRefVec, StringRefVec> temp_map;
 
+  auto normalize_set = [](const StringRefVec &In) {
+    StringRefVec Out(In.begin(), In.end());
+    llvm::sort(Out);
+    Out.erase(std::unique(Out.begin(), Out.end()), Out.end());
+    return Out;
+  };
+
   for (const auto &[src, tgts] : witness_one_to_many) {
-    temp_map[tgts].push_back(src);
+    StringRefVec norm_tgts = normalize_set(tgts);
+    temp_map[norm_tgts].push_back(src);
   }
 
   for (const auto &[tgts, srcs] : temp_map) {
-    many_to_many[srcs] = tgts;
+    StringRefVec norm_srcs = normalize_set(srcs);
+    StringRefVec norm_tgts = normalize_set(tgts);
+    many_to_many[norm_srcs] = norm_tgts;
   }
 
   errs() << "\n=== Step 2B: Many-to-Many Clusters ===\n";
@@ -826,96 +812,70 @@ void SimplifyCFGWitness::generateWitness(
   // STEP 2C: STATE DEFINITIONS FOR ALL VARIABLES
   // Track actual SSA values computed at each block.
   // ==========================================================
-  z3::expr x1 = c.int_const("x1");    // x + 1, computed in if_true
-  z3::expr x12 = c.int_const("x12");  // x + 5, computed in if_false
-  z3::expr cmp = c.bool_const("cmp"); // x < 10, computed at merge/entry
-
-  // Helper to build state maps (use vector of pairs to avoid default
-  // construction issues)
-  using StateMap =
-      DenseMap<StringRef, SmallVector<std::pair<StringRef, z3::expr>, 2>>;
 
   // Source block state: only include variables actually COMPUTED in that block
   // (not passed through from predecessors)
-  StateMap src_state;
-  src_state["entry"] = {};                       // entry: just passes x through
-  src_state["merge"].push_back({"cmp", x < 10}); // merge: computes cmp
-  src_state["if_true"].push_back({"x1", x + 1}); // if_true: computes x1
-  src_state["if_false"].push_back({"x12", x + 5}); // if_false: computes x12
-
-  // Target block state: only include variables actually COMPUTED in that block
-  StateMap tgt_state;
-  tgt_state["entry"].push_back({"cmp", x < 10});   // entry: computes cmp
-  tgt_state["if_true"].push_back({"x1", x + 1});   // if_true: computes x1
-  tgt_state["if_false"].push_back({"x12", x + 5}); // if_false: computes x12
-  tgt_state["common.ret"] = {}; // common.ret: phi merge, no new computation
-
-  auto get_src_var = [&](StringRef block, StringRef var) -> z3::expr {
-    auto block_it = src_state.find(block);
-    if (block_it != src_state.end()) {
-      for (const auto &[v, val] : block_it->second) {
-        if (v == var)
-          return val;
-      }
-    }
-    std::string Name = (Twine("undef_src_") + block + "_" + var).str();
-    return c.int_const(Name.c_str());
-  };
-
-  auto get_tgt_var = [&](StringRef block, StringRef var) -> z3::expr {
-    auto block_it = tgt_state.find(block);
-    if (block_it != tgt_state.end()) {
-      for (const auto &[v, val] : block_it->second) {
-        if (v == var)
-          return val;
-      }
-    }
-    std::string Name = (Twine("undef_tgt_") + block + "_" + var).str();
-    return c.int_const(Name.c_str());
-  };
 
   auto reach_src_set = [&](const StringRefVec &Set) {
     z3::expr cond = c.bool_val(false);
     for (StringRef S : Set)
-      cond = cond || lookup_src_cond(S);
+      cond = cond && lookup_src_cond(S);
     return cond;
   };
 
   auto reach_tgt_set = [&](const StringRefVec &Set) {
     z3::expr cond = c.bool_val(false);
     for (StringRef T : Set)
-      cond = cond || lookup_tgt_cond(T);
+      cond = cond && lookup_tgt_cond(T);
     return cond;
   };
 
-  z3::expr_vector vcs(c);
-
-  // ==========================================================
+  z3::expr_vector path_checking(c);
+  z3::expr_vector state_checking(c);
+  StringRefVec dead_blocks;
+  dead_blocks.push_back("dead_block");
+6  // ==========================================================
   // STEP 3: VERIFICATION CONDITIONS - REACHABILITY ONLY
   // ==========================================================
 
   errs() << "\n=== Step 3: Generating Reachability VCs ===\n";
 
+  // ==========================================================
+  // STEP 3: CLUSTER-BASED VERIFICATION CONDITIONS
+  // Iterate through many_to_many map <sources_vec, targets_vec>
+  // and apply different logic based on cluster type
+  // ==========================================================
+
+  errs() << "\n=== Step 3: Generating Verification Conditions by Cluster Type "
+            "===\n";
   for (const auto &[srcs, tgts] : many_to_many) {
-    z3::expr src_reach = reach_src_set(srcs);
-    z3::expr tgt_reach = reach_tgt_set(tgts);
 
-    // (A) Reachability: bidirectional to handle splits/merges
-    vcs.push_back(z3::implies(tgt_reach, src_reach));
-
-    errs() << "  Cluster: {";
+    errs() << "\n  Processing Cluster: {";
     for (size_t i = 0; i < srcs.size(); ++i) {
       errs() << srcs[i];
       if (i + 1 < srcs.size())
         errs() << ", ";
     }
-    errs() << "} <-> {";
+    errs() << "} -> {";
     for (size_t i = 0; i < tgts.size(); ++i) {
       errs() << tgts[i];
       if (i + 1 < tgts.size())
         errs() << ", ";
     }
     errs() << "}\n";
+
+    // Path-condition equivalence for this cluster.
+    z3::expr src_pc = reach_src_set(srcs);
+    z3::expr tgt_pc = reach_tgt_set(tgts);
+
+    // z3::expr pc_vc = implies(tgt_pc, src_pc);
+    // errs() << Z3_ast_to_string(c, pc_vc);
+    // path_checking.push_back(pc_vc);
+
+    z3::expr state_eq_vc =
+        CFGMappingWitness::buildCommonVariableEquality(c, srcs, tgts);
+    errs() << "State_checking for block" << Z3_ast_to_string(c, state_eq_vc);
+    state_checking.push_back(state_eq_vc);
   }
 
   // ==========================================================
@@ -924,21 +884,44 @@ void SimplifyCFGWitness::generateWitness(
   // Target: common.ret is the sole exit block
   // Ensures total reachability is preserved at exit.
   // ==========================================================
-  z3::expr total_src_exit = ups_src_if_true || ups_src_if_false;
-  z3::expr total_tgt_exit = ups_tgt_common_ret;
-  vcs.push_back(total_tgt_exit == total_src_exit);
+  z3::expr total_src_exit =
+      lookup_src_cond("if_true") || lookup_src_cond("if_false");
+  z3::expr total_tgt_exit = lookup_tgt_cond("common.ret");
+  path_checking.push_back(total_tgt_exit == total_src_exit);
+  z3::expr_vector dead_block_vec(c);
+  // Dead-block reachability: not (pc(block1) or pc(block2) ...).
+  if (!dead_blocks.empty()) {
+    for (StringRef Dead : dead_blocks){
+      z3::expr dead_block = !(c.bool_val(false) || (lookup_src_cond(Dead)));
+      dead_block_vec.push_back(dead_block);
+    }
+  }
+
+  for (unsigned i = 0; i < dead_block_vec.size(); ++i) {
+    errs() << "dead_block_vec[" << i
+           << "] = " << Z3_ast_to_string(c, dead_block_vec[i]) << "\n";
+  }
 
   // ==========================================================
   // STEP 5: Z3 VERIFICATION
   // ==========================================================
-  z3::expr final_vc = z3::mk_and(vcs);
+
+  // errs() << "\n" << "state_checking" << Z3_ast_to_string(c,
+  // z3::mk_and(state_checking) ) << "\n"; errs() << "path_checking"
+  // <<Z3_ast_to_string(c, z3::mk_and(path_checking)) << "\n";
+
+  z3::expr final_vc = z3::mk_and(path_checking) && z3::mk_and(state_checking)  && z3::mk_and(dead_block_vec);
+  final_vc.simplify();
 
   // Display the VC for debugging
   errs() << "Generated Verification Condition:\n"
          << Z3_ast_to_string(c, final_vc) << "\n\n";
 
   // Prove by checking if the negation is unsatisfiable
-  solver.add(!z3::forall(x, final_vc));
+  if (forall_vars.empty())
+    solver.add(!final_vc);
+  else
+    solver.add(!z3::forall(forall_vars, final_vc));
 
   z3::check_result result = solver.check();
 
@@ -953,3 +936,5 @@ void SimplifyCFGWitness::generateWitness(
     }
   }
 }
+
+/*hi*/
