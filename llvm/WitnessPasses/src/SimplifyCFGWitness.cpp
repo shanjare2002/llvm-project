@@ -414,21 +414,19 @@ static void dumpBlockZ3ValueMap(Function &F, const Z3BlockMap &Map,
 
 } // namespace
 
-// Forward declaration for our custom simplifyCFG with blockMap support
+// Forward declaration for our custom simplifyCFG
 namespace witness {
 
 bool simplifyCFG(BasicBlock *BB, const TargetTransformInfo &TTI,
                  DomTreeUpdater *DTU, const SimplifyCFGOptions &Options,
-                 ArrayRef<WeakVH> LoopHeaders,
-                 DenseMap<BasicBlock *, BasicBlock *> *BlockMap = nullptr);
+                 ArrayRef<WeakVH> LoopHeaders);
 }
 
-// ===== Copied SimplifyCFG implementation for block tracking =====
+// ===== Copied SimplifyCFG implementation =====
 
-static bool performBlockTailMerging(
-    Function &F, ArrayRef<BasicBlock *> BBs,
-    std::vector<DominatorTree::UpdateType> *Updates,
-    DenseMap<BasicBlock *, BasicBlock *> *blockMap = nullptr) {
+static bool
+performBlockTailMerging(Function &F, ArrayRef<BasicBlock *> BBs,
+                        std::vector<DominatorTree::UpdateType> *Updates) {
   SmallVector<PHINode *, 1> NewOps;
 
   if (BBs.size() < 2)
@@ -474,9 +472,6 @@ static bool performBlockTailMerging(
 
     if (Updates)
       Updates->push_back({DominatorTree::Insert, BB, CanonicalBB});
-
-    if (blockMap)
-      (*blockMap)[BB] = CanonicalBB;
   }
 
   errs() << "performBlockTailMerging: merged " << BBs.size() << " blocks into "
@@ -488,7 +483,8 @@ static bool performBlockTailMerging(
 
 static bool tailMergeBlocksWithSimilarFunctionTerminators(
     Function &F, DomTreeUpdater *DTU,
-    DenseMap<BasicBlock *, BasicBlock *> *blockMap = nullptr) {
+    DenseMap<StringRef, StringRefVec> &witnessOneToMany) {
+  (void)witnessOneToMany;
   SmallMapVector<unsigned, SmallVector<BasicBlock *, 2>, 4> Structure;
 
   for (BasicBlock &BB : F) {
@@ -528,8 +524,7 @@ static bool tailMergeBlocksWithSimilarFunctionTerminators(
   }
 
   for (ArrayRef<BasicBlock *> BBs : make_second_range(Structure))
-    Changed |=
-        performBlockTailMerging(F, BBs, DTU ? &Updates : nullptr, blockMap);
+    Changed |= performBlockTailMerging(F, BBs, DTU ? &Updates : nullptr);
 
   if (DTU)
     DTU->applyUpdates(Updates);
@@ -537,10 +532,9 @@ static bool tailMergeBlocksWithSimilarFunctionTerminators(
   return Changed;
 }
 
-static bool iterativelySimplifyCFG(
-    Function &F, const TargetTransformInfo &TTI, DomTreeUpdater *DTU,
-    const SimplifyCFGOptions &Options,
-    DenseMap<BasicBlock *, BasicBlock *> *blockMap = nullptr) {
+static bool iterativelySimplifyCFG(Function &F, const TargetTransformInfo &TTI,
+                                   DomTreeUpdater *DTU,
+                                   const SimplifyCFGOptions &Options) {
   bool Changed = false;
   bool LocalChange = true;
 
@@ -569,17 +563,8 @@ static bool iterativelySimplifyCFG(
           ++BBIt;
       }
 
-      // Track the block's single predecessor before simplification
-      BasicBlock *Pred = BB->getSinglePredecessor();
-
-      if (witness::simplifyCFG(BB, TTI, DTU, Options, LoopHeaders, blockMap)) {
+      if (witness::simplifyCFG(BB, TTI, DTU, Options, LoopHeaders)) {
         LocalChange = true;
-
-        // If BB was merged into its predecessor, record it
-        if (blockMap && Pred && BB->getParent() == nullptr) {
-          (*blockMap)[BB] = Pred;
-          errs() << "iterativelySimplifyCFG: merged block into predecessor\n";
-        }
       }
     }
     Changed |= LocalChange;
@@ -587,42 +572,38 @@ static bool iterativelySimplifyCFG(
   return Changed;
 }
 
-static bool simplifyFunctionCFGImpl(
-    Function &F, const TargetTransformInfo &TTI, DominatorTree *DT,
-    const SimplifyCFGOptions &Options,
-    DenseMap<BasicBlock *, BasicBlock *> *blockMap = nullptr) {
+static bool
+simplifyFunctionCFGImpl(Function &F, const TargetTransformInfo &TTI,
+                        DominatorTree *DT, const SimplifyCFGOptions &Options,
+                        DenseMap<StringRef, StringRefVec> &witnessOneToMany,
+                        SmallVector<std::string, 16> &deadBlocks) {
+  (void)witnessOneToMany;
   DomTreeUpdater DTU(DT, DomTreeUpdater::UpdateStrategy::Eager);
   DomTreeUpdater *DTUPtr = &DTU;
 
-  // First removeUnreachableBlocks call (line 222)
-  SmallPtrSet<BasicBlock *, 16> BlocksBefore1;
-  SmallVector<std::pair<BasicBlock *, std::string>, 16> BlockInfoBefore1;
+  SmallVector<std::pair<BasicBlock *, std::string>, 16> BlocksBefore;
+  BlocksBefore.reserve(F.size());
   for (BasicBlock &BB : F) {
-    BlocksBefore1.insert(&BB);
-    BlockInfoBefore1.push_back({&BB, BB.hasName() ? BB.getName().str() : ""});
+    BlocksBefore.push_back({&BB, BB.hasName() ? BB.getName().str() : ""});
   }
 
   bool EverChanged = removeUnreachableBlocks(F, DT ? DTUPtr : nullptr);
+  if (EverChanged) {
+    SmallPtrSet<BasicBlock *, 16> BlocksAfter;
+    for (BasicBlock &BB : F)
+      BlocksAfter.insert(&BB);
 
-  if (EverChanged && blockMap) {
-    SmallPtrSet<BasicBlock *, 16> BlocksAfter1;
-    for (BasicBlock &BB : F) {
-      BlocksAfter1.insert(&BB);
-    }
-    for (auto &[BBPtr, Name] : BlockInfoBefore1) {
-      if (!BlocksAfter1.count(BBPtr)) {
-        (*blockMap)[BBPtr] = nullptr;
-        errs() << "removeUnreachableBlocks(#1): DELETED "
-               << (Name.empty() ? "unnamed" : Name) << "\n";
+    for (const auto &Entry : BlocksBefore) {
+      if (!BlocksAfter.count(Entry.first)) {
+        deadBlocks.push_back(Entry.second);
       }
     }
   }
 
-  EverChanged |= tailMergeBlocksWithSimilarFunctionTerminators(
-      F, DT ? DTUPtr : nullptr, blockMap);
+    EverChanged |= tailMergeBlocksWithSimilarFunctionTerminators(
+      F, DT ? DTUPtr : nullptr, witnessOneToMany);
 
-  EverChanged |=
-      iterativelySimplifyCFG(F, TTI, DT ? DTUPtr : nullptr, Options, blockMap);
+  EverChanged |= iterativelySimplifyCFG(F, TTI, DT ? DTUPtr : nullptr, Options);
 
   if (!EverChanged)
     return false;
@@ -631,8 +612,8 @@ static bool simplifyFunctionCFGImpl(
     return EverChanged;
 
   do {
-    EverChanged = iterativelySimplifyCFG(F, TTI, DT ? DTUPtr : nullptr, Options,
-                                         blockMap);
+    EverChanged =
+        iterativelySimplifyCFG(F, TTI, DT ? DTUPtr : nullptr, Options);
     EverChanged |= removeUnreachableBlocks(F, DT ? DTUPtr : nullptr);
   } while (EverChanged);
 
@@ -642,8 +623,10 @@ static bool simplifyFunctionCFGImpl(
 static bool
 simplifyFunctionCFG(Function &F, const TargetTransformInfo &TTI,
                     DominatorTree *DT, const SimplifyCFGOptions &Options,
-                    DenseMap<BasicBlock *, BasicBlock *> *blockMap = nullptr) {
-  return simplifyFunctionCFGImpl(F, TTI, DT, Options, blockMap);
+                    DenseMap<StringRef, StringRefVec> &witnessOneToMany,
+                    SmallVector<std::string, 16> &deadBlocks) {
+  return simplifyFunctionCFGImpl(F, TTI, DT, Options, witnessOneToMany,
+                                 deadBlocks);
 }
 
 // ===== End of copied SimplifyCFG implementation =====
@@ -666,26 +649,27 @@ PreservedAnalyses SimplifyCFGWitness::run(Function &F,
   CFGMappingWitness::initialize(&F, &SymCtx);
   CFGMappingWitness::buildSourceMappings();
 
-  // Internal blockMap for tracking merges
-  DenseMap<BasicBlock *, BasicBlock *> blockMap;
+  DenseMap<StringRef, StringRefVec> witnessOneToMany;
+  witnessOneToMany["entry"].push_back("entry");
+  witnessOneToMany["merge"].push_back("entry");
+  witnessOneToMany["if_true"].push_back("if_true");
+  witnessOneToMany["if_true"].push_back("common.ret");
+  witnessOneToMany["if_false"].push_back("if_false");
+  witnessOneToMany["if_false"].push_back("common.ret");
 
-  errs() << "Calling simplifyFunctionCFG with blockMap...\n";
-  ;
-  bool Changed = simplifyFunctionCFG(F, TTI, DT, Options, &blockMap);
+  SmallVector<std::string, 16> deadBlocks;
+  errs() << "Calling simplifyFunctionCFG...\n";
+  bool Changed =
+      simplifyFunctionCFG(F, TTI, DT, Options, witnessOneToMany, deadBlocks);
   errs() << "simplifyFunctionCFG returned, Changed=" << Changed << "\n";
 
   // ===== CAPTURE TARGET STATE =====
   errs() << "\n=== Capturing Target CFG State After Transformation ===\n";
   CFGMappingWitness::buildTargetMappings();
 
-  // All block mapping and inference is done by SimplifyCFGUtils
-  // Just display the final blockMap
-  errs() << "\n=== Final blockMap from SimplifyCFGUtils ===\n";
-  errs() << "blockMap size: " << blockMap.size() << "\n";
-
-  // Pass static CFGMappingWitness reference and blockMap to generateWitness
+  // Pass static CFGMappingWitness reference to generateWitness
   CFGMappingWitness dummyWitness; // Placeholder since we use static methods
-  generateWitness(F, dummyWitness, blockMap, SymCtx);
+  generateWitness(F, dummyWitness, witnessOneToMany, deadBlocks, SymCtx);
 
   // Release Z3 expressions before SymCtx is destroyed.
   CFGMappingWitness::clear();
@@ -699,7 +683,8 @@ PreservedAnalyses SimplifyCFGWitness::run(Function &F,
 /// Uses explicit block mapping to verify transformation soundness
 void SimplifyCFGWitness::generateWitness(
     Function &F, CFGMappingWitness &CFGWitness,
-    DenseMap<BasicBlock *, BasicBlock *> &blockMap, z3::context &SymCtx) {
+    DenseMap<StringRef, StringRefVec> &witnessOneToMany,
+    ArrayRef<std::string> deadNames, z3::context &SymCtx) {
   errs() << "\n=== INTEGRATED SIMPLIFY-CFG WITNESS VALIDATION ===\n";
 
   z3::context &c = SymCtx;
@@ -733,16 +718,8 @@ void SimplifyCFGWitness::generateWitness(
   // Each source block maps to one or more target blocks.
   // This is the initial witness produced by the transformation.
   // ==========================================================
-  DenseMap<StringRef, StringRefVec> witness_one_to_many;
-  witness_one_to_many["entry"].push_back("entry");
-  witness_one_to_many["merge"].push_back("entry");
-  witness_one_to_many["if_true"].push_back("if_true");
-  witness_one_to_many["if_true"].push_back("common.ret");
-  witness_one_to_many["if_false"].push_back("if_false");
-  witness_one_to_many["if_false"].push_back("common.ret");
-
   errs() << "\n=== Step 2A: One-to-Many Witness ===\n";
-  for (const auto &[src, tgts] : witness_one_to_many) {
+  for (const auto &[src, tgts] : witnessOneToMany) {
     errs() << "  " << src << " -> {";
     for (size_t i = 0; i < tgts.size(); ++i) {
       errs() << tgts[i];
@@ -768,7 +745,7 @@ void SimplifyCFGWitness::generateWitness(
     return Out;
   };
 
-  for (const auto &[src, tgts] : witness_one_to_many) {
+  for (const auto &[src, tgts] : witnessOneToMany) {
     StringRefVec norm_tgts = normalize_set(tgts);
     temp_map[norm_tgts].push_back(src);
   }
@@ -832,9 +809,7 @@ void SimplifyCFGWitness::generateWitness(
 
   z3::expr_vector path_checking(c);
   z3::expr_vector state_checking(c);
-  StringRefVec dead_blocks;
-  dead_blocks.push_back("dead_block");
-6  // ==========================================================
+  // ==========================================================
   // STEP 3: VERIFICATION CONDITIONS - REACHABILITY ONLY
   // ==========================================================
 
@@ -890,11 +865,9 @@ void SimplifyCFGWitness::generateWitness(
   path_checking.push_back(total_tgt_exit == total_src_exit);
   z3::expr_vector dead_block_vec(c);
   // Dead-block reachability: not (pc(block1) or pc(block2) ...).
-  if (!dead_blocks.empty()) {
-    for (StringRef Dead : dead_blocks){
-      z3::expr dead_block = !(c.bool_val(false) || (lookup_src_cond(Dead)));
-      dead_block_vec.push_back(dead_block);
-    }
+  for (const std::string &Dead : deadNames) {
+    z3::expr dead_block = !(c.bool_val(false) || (lookup_src_cond(Dead)));
+    dead_block_vec.push_back(dead_block);
   }
 
   for (unsigned i = 0; i < dead_block_vec.size(); ++i) {
@@ -910,7 +883,8 @@ void SimplifyCFGWitness::generateWitness(
   // z3::mk_and(state_checking) ) << "\n"; errs() << "path_checking"
   // <<Z3_ast_to_string(c, z3::mk_and(path_checking)) << "\n";
 
-  z3::expr final_vc = z3::mk_and(path_checking) && z3::mk_and(state_checking)  && z3::mk_and(dead_block_vec);
+  z3::expr final_vc = z3::mk_and(path_checking) && z3::mk_and(state_checking) &&
+                      z3::mk_and(dead_block_vec);
   final_vc.simplify();
 
   // Display the VC for debugging

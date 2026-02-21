@@ -182,7 +182,6 @@ class SimplifyCFGOpt {
   ArrayRef<WeakVH> LoopHeaders;
   const SimplifyCFGOptions &Options;
   bool Resimplify;
-  DenseMap<BasicBlock *, BasicBlock *> *BlockMap;
 
   Value *isValueEqualityComparison(Instruction *TI);
   BasicBlock *getValueEqualityComparisonCases(
@@ -228,10 +227,8 @@ class SimplifyCFGOpt {
 public:
   SimplifyCFGOpt(const TargetTransformInfo &TTI, DomTreeUpdater *DTU,
                  const DataLayout &DL, ArrayRef<WeakVH> LoopHeaders,
-                 const SimplifyCFGOptions &Opts,
-                 DenseMap<BasicBlock *, BasicBlock *> *BM = nullptr)
-      : TTI(TTI), DTU(DTU), DL(DL), LoopHeaders(LoopHeaders), Options(Opts),
-        BlockMap(BM) {
+                 const SimplifyCFGOptions &Opts)
+      : TTI(TTI), DTU(DTU), DL(DL), LoopHeaders(LoopHeaders), Options(Opts) {
     assert((!DTU || !DTU->hasPostDomTree()) &&
            "SimplifyCFG is not yet capable of maintaining validity of a "
            "PostDomTree, so don't ask for it.");
@@ -246,31 +243,8 @@ public:
     return true;
   }
 
-  // Wrapper around MergeBlockIntoPredecessor that tracks the merge in BlockMap
-  bool mergeBlockIntoPredecessorWithTracking(BasicBlock *BB) {
-    BasicBlock *Pred = BB->getSinglePredecessor();
-    if (!Pred)
-      return false;
-
-    bool Merged = MergeBlockIntoPredecessor(BB, DTU);
-
-    if (Merged && BlockMap && Pred) {
-      // Track that BB was merged into its predecessor
-      (*BlockMap)[BB] = Pred;
-      errs() << "SimplifyCFGUtils: Tracked merge in "
-                "foldCondBranchOnValueKnownInPredecessor: "
-             << BB->getName() << " -> " << Pred->getName() << "\n";
-
-      // Update all blocks that previously mapped to BB to now map to Pred
-      for (auto &Entry : *BlockMap) {
-        if (Entry.first != BB && Entry.second == BB) {
-          Entry.second = Pred;
-          errs() << "SimplifyCFGUtils: Updated transitive mapping\n";
-        }
-      }
-    }
-
-    return Merged;
+  bool mergeBlockIntoPredecessorIfPossible(BasicBlock *BB) {
+    return MergeBlockIntoPredecessor(BB, DTU);
   }
 };
 
@@ -3403,10 +3377,10 @@ static ConstantInt *getKnownValueOnEdge(Value *V, BasicBlock *From,
 /// If we have a conditional branch on something for which we know the constant
 /// value in predecessors (e.g. a phi node in the current block), thread edges
 /// from the predecessor to their ultimate destination.
-static std::optional<bool> foldCondBranchOnValueKnownInPredecessorImpl(
-    BranchInst *BI, DomTreeUpdater *DTU, const DataLayout &DL,
-    AssumptionCache *AC,
-    DenseMap<BasicBlock *, BasicBlock *> *BlockMap = nullptr) {
+static std::optional<bool>
+foldCondBranchOnValueKnownInPredecessorImpl(BranchInst *BI, DomTreeUpdater *DTU,
+                                            const DataLayout &DL,
+                                            AssumptionCache *AC) {
   SmallMapVector<ConstantInt *, SmallSetVector<BasicBlock *, 2>, 2> KnownValues;
   BasicBlock *BB = BI->getParent();
   Value *Cond = BI->getCondition();
@@ -3552,15 +3526,7 @@ static std::optional<bool> foldCondBranchOnValueKnownInPredecessorImpl(
     // it back into the predecessor if possible. This not only avoids
     // unnecessary SimplifyCFG iterations, but also makes sure that we don't
     // bypass the check for trivial cycles above.
-    BasicBlock *EdgeBBPred = EdgeBB->getSinglePredecessor();
-    if (MergeBlockIntoPredecessor(EdgeBB, DTU)) {
-      if (BlockMap && EdgeBBPred) {
-        (*BlockMap)[EdgeBB] = EdgeBBPred;
-        errs() << "SimplifyCFGUtils: Tracked merge in "
-                  "foldCondBranchOnValueKnownInPredecessorImpl: "
-               << EdgeBB->getName() << " -> " << EdgeBBPred->getName() << "\n";
-      }
-    }
+    (void)MergeBlockIntoPredecessor(EdgeBB, DTU);
 
     // Signal repeat, simplifying any other constants.
     return std::nullopt;
@@ -3569,16 +3535,15 @@ static std::optional<bool> foldCondBranchOnValueKnownInPredecessorImpl(
   return false;
 }
 
-static bool foldCondBranchOnValueKnownInPredecessor(
-    BranchInst *BI, DomTreeUpdater *DTU, const DataLayout &DL,
-    AssumptionCache *AC,
-    DenseMap<BasicBlock *, BasicBlock *> *BlockMap = nullptr) {
+static bool foldCondBranchOnValueKnownInPredecessor(BranchInst *BI,
+                                                    DomTreeUpdater *DTU,
+                                                    const DataLayout &DL,
+                                                    AssumptionCache *AC) {
   std::optional<bool> Result;
   bool EverChanged = false;
   do {
     // Note that None means "we changed things, but recurse further."
-    Result =
-        foldCondBranchOnValueKnownInPredecessorImpl(BI, DTU, DL, AC, BlockMap);
+    Result = foldCondBranchOnValueKnownInPredecessorImpl(BI, DTU, DL, AC);
     EverChanged |= Result == std::nullopt || *Result;
   } while (Result == std::nullopt);
   return EverChanged;
@@ -5206,15 +5171,8 @@ bool SimplifyCFGOpt::simplifyCommonResume(ResumeInst *RI) {
   }
 
   // Delete the resume block if all its predecessors have been removed.
-  if (pred_empty(BB)) {
-    if (BlockMap) {
-      (*BlockMap)[BB] = nullptr; // Block is being deleted
-      errs()
-          << "SimplifyCFGUtils: DEAD BLOCK DELETION in simplifySingleResume: "
-          << BB->getName() << " (no predecessors)\n";
-    }
+  if (pred_empty(BB))
     DeleteDeadBlock(BB, DTU);
-  }
 
   return !TrivialUnwindBlocks.empty();
 }
@@ -5239,11 +5197,6 @@ bool SimplifyCFGOpt::simplifySingleResume(ResumeInst *RI) {
   }
 
   // The landingpad is now unreachable.  Zap it.
-  if (BlockMap) {
-    (*BlockMap)[BB] = nullptr; // Block is being deleted
-    errs() << "SimplifyCFGUtils: Tracked deletion in simplifySingleResume "
-              "(landingpad)\n";
-  }
   DeleteDeadBlock(BB, DTU);
   return true;
 }
@@ -5361,8 +5314,6 @@ static bool removeEmptyCleanup(CleanupReturnInst *RI, DomTreeUpdater *DTU) {
   if (DTU)
     DTU->applyUpdates(Updates);
 
-  // Note: BlockMap not accessible in static function, would need to thread
-  // through
   DeleteDeadBlock(BB, DTU);
 
   return true;
@@ -5596,12 +5547,6 @@ bool SimplifyCFGOpt::simplifyUnreachable(UnreachableInst *UI) {
 
   // If this block is now dead, remove it.
   if (pred_empty(BB) && BB != &BB->getParent()->getEntryBlock()) {
-    if (BlockMap) {
-      (*BlockMap)[BB] = nullptr; // Block is being deleted
-      errs() << "SimplifyCFGUtils: DEAD BLOCK DELETION in "
-                "simplifyCleanupReturn: "
-             << BB->getName() << " (no predecessors)\n";
-    }
     DeleteDeadBlock(BB, DTU);
     return true;
   }
@@ -8066,8 +8011,7 @@ bool SimplifyCFGOpt::simplifyCondBranch(BranchInst *BI, IRBuilder<> &Builder) {
   // If this is a branch on something for which we know the constant value
   // in predecessors (e.g. a phi node in the current block), thread
   // control through this block.
-  if (foldCondBranchOnValueKnownInPredecessor(BI, DTU, DL, Options.AC,
-                                              BlockMap))
+  if (foldCondBranchOnValueKnownInPredecessor(BI, DTU, DL, Options.AC))
     return requestResimplify();
 
   // Scan predecessor blocks for conditional branches.
@@ -8310,16 +8254,6 @@ bool SimplifyCFGOpt::simplifyOnce(BasicBlock *BB) {
   if ((pred_empty(BB) && BB != &BB->getParent()->getEntryBlock()) ||
       BB->getSinglePredecessor() == BB) {
     LLVM_DEBUG(dbgs() << "Removing BB: \n" << *BB);
-    if (BlockMap) {
-      (*BlockMap)[BB] = nullptr; // Block is deleted (unreachable)
-      if (pred_empty(BB)) {
-        errs() << "SimplifyCFGUtils: DEAD BLOCK DELETION in simplifyOnce: "
-               << BB->getName() << " (no predecessors)\n";
-      } else {
-        errs() << "SimplifyCFGUtils: DEAD BLOCK DELETION in simplifyOnce: "
-               << BB->getName() << " (self-loop)\n";
-      }
-    }
     DeleteDeadBlock(BB, DTU);
     return true;
   }
@@ -8340,7 +8274,7 @@ bool SimplifyCFGOpt::simplifyOnce(BasicBlock *BB) {
   // Merge basic blocks into their predecessor if there is only one
   // distinct pred, and if there is only one distinct successor of
   // the predecessor, and if there are no PHI nodes.
-  if (mergeBlockIntoPredecessorWithTracking(BB))
+  if (mergeBlockIntoPredecessorIfPossible(BB))
     return true;
 
   if (SinkCommon && Options.SinkCommonInsts)
@@ -8413,10 +8347,8 @@ bool SimplifyCFGOpt::run(BasicBlock *BB) {
 namespace witness {
 bool simplifyCFG(BasicBlock *BB, const TargetTransformInfo &TTI,
                  DomTreeUpdater *DTU, const SimplifyCFGOptions &Options,
-                 ArrayRef<WeakVH> LoopHeaders,
-                 DenseMap<BasicBlock *, BasicBlock *> *BlockMap) {
-  return SimplifyCFGOpt(TTI, DTU, BB->getDataLayout(), LoopHeaders, Options,
-                        BlockMap)
+                 ArrayRef<WeakVH> LoopHeaders) {
+  return SimplifyCFGOpt(TTI, DTU, BB->getDataLayout(), LoopHeaders, Options)
       .run(BB);
 }
 } // namespace witness
