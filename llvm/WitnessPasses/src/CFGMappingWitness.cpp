@@ -391,6 +391,40 @@ Z3BlockMap CFGMappingWitness::buildBlockZ3ValueMap(PhiIncomingMap *PhiMap,
   for (Argument &A : F->args())
     GlobalMap.insert({&A, makeFreshZ3Expr(&A, *SymCtx)});
 
+  // Pre-pass: for each AllocaInst, if every store to it writes the same
+  // constant, record that constant so loads can be resolved concretely.
+  // This models e.g. "store 2, %y" in both branches => load %y == 2.
+  std::map<const Value *, z3::expr> ConstAllocaMap;
+  for (BasicBlock &BB : *F) {
+    for (Instruction &I : BB) {
+      if (auto *AI = dyn_cast<AllocaInst>(&I)) {
+        std::optional<int64_t> ConstVal;
+        bool AllSameConst = true;
+        for (User *U : AI->users()) {
+          if (auto *SI = dyn_cast<StoreInst>(U)) {
+            if (auto *CI = dyn_cast<ConstantInt>(SI->getValueOperand())) {
+              int64_t V = CI->getSExtValue();
+              if (!ConstVal.has_value())
+                ConstVal = V;
+              else if (*ConstVal != V) {
+                AllSameConst = false;
+                break;
+              }
+            } else {
+              AllSameConst = false;
+              break;
+            }
+          }
+        }
+        if (AllSameConst && ConstVal.has_value()) {
+          errs() << "  [ConstAlloca] " << AI->getName()
+                 << " always stores " << *ConstVal << "\n";
+          ConstAllocaMap.insert_or_assign(AI, SymCtx->int_val(*ConstVal));
+        }
+      }
+    }
+  }
+
   // Add instructions per block
   for (BasicBlock &BB : *F) {
     std::string BlockName =
@@ -398,6 +432,16 @@ Z3BlockMap CFGMappingWitness::buildBlockZ3ValueMap(PhiIncomingMap *PhiMap,
     std::map<const Value *, z3::expr> LocalMap = GlobalMap;
 
     for (Instruction &I : BB) {
+      // Resolve loads from constant-store allocas concretely.
+      if (auto *LI = dyn_cast<LoadInst>(&I)) {
+        Value *Ptr = LI->getPointerOperand();
+        auto It = ConstAllocaMap.find(Ptr);
+        if (It != ConstAllocaMap.end()) {
+          LocalMap.insert({&I, It->second});
+          continue;
+        }
+      }
+
       if (I.getType()->isVoidTy())
         continue;
 
@@ -710,17 +754,23 @@ CFGMappingWitness::getTargetBlockValues(const BasicBlock *BB) {
 /// (src_var1_src == tgt_var1_tgt && ...)
 z3::expr
 CFGMappingWitness::buildCommonVariableEquality(z3::context &C,
-                                               const StringRefVec &src_blocks,
-                                               const StringRefVec &tgt_blocks) {
+                                               ArrayRef<std::string> src_blocks,
+                                               ArrayRef<std::string> tgt_blocks,
+                                               ArrayRef<std::string> tgt_phi_hint) {
   std::map<std::string, z3::expr> src_values;
   std::map<std::string, z3::expr> tgt_values;
 
   auto accumulate_values =
       [](const StringBlockMap &StrMap, const Z3BlockMap &Z3Map,
-         const PhiIncomingMap &PhiMap, const StringRefVec &Blocks,
+         const PhiIncomingMap &PhiMap, ArrayRef<std::string> Blocks,
+         ArrayRef<std::string> PhiHint,
          std::map<std::string, z3::expr> &Out) {
-        for (StringRef Block : Blocks) {
-          std::string BlockName = Block.str();
+        // If PhiHint is non-empty, use it for PHI incoming block resolution
+        // instead of Blocks. This lets SPLIT callers resolve PHIs using the
+        // source block names (the actual predecessor in the original CFG).
+        ArrayRef<std::string> PhiBlocks = PhiHint.empty() ? Blocks : PhiHint;
+        for (const std::string &Block : Blocks) {
+          std::string BlockName = Block;
           auto StrIt = StrMap.find(BlockName);
           if (StrIt == StrMap.end())
             continue;
@@ -732,6 +782,10 @@ CFGMappingWitness::buildCommonVariableEquality(z3::context &C,
             const Value *V = KV.first;
             if (isa<Constant>(V))
               continue;
+            // AllocaInst produces a pointer/memory location, not a semantic
+            // value — skip it from cross-side equality comparison.
+            if (isa<AllocaInst>(V))
+              continue;
             std::string VarName = getValueName(V);
             if (VarName.rfind("v0x", 0) == 0)
               continue;
@@ -741,7 +795,7 @@ CFGMappingWitness::buildCommonVariableEquality(z3::context &C,
             if (isa<PHINode>(V)) {
               auto PhiIt = PhiMap.find(VarName);
               if (PhiIt != PhiMap.end()) {
-                for (StringRef IncomingBlock : Blocks) {
+                for (StringRef IncomingBlock : PhiBlocks) {
                   auto IncomingIt = PhiIt->second.find(IncomingBlock.str());
                   if (IncomingIt != PhiIt->second.end()) {
                     Out.emplace(VarName, IncomingIt->second);
@@ -763,12 +817,12 @@ CFGMappingWitness::buildCommonVariableEquality(z3::context &C,
       };
 
   auto add_return_value = [&](const RetValueMap &RetMap,
-                              const StringRefVec &Blocks,
+                              ArrayRef<std::string> Blocks,
                               std::map<std::string, z3::expr> &Out) {
     if (Out.count("ret") != 0)
       return;
-    for (StringRef Block : Blocks) {
-      auto It = RetMap.find(Block.str());
+    for (const std::string &Block : Blocks) {
+      auto It = RetMap.find(Block);
       if (It != RetMap.end()) {
         Out.emplace("ret", It->second);
         return;
@@ -776,8 +830,8 @@ CFGMappingWitness::buildCommonVariableEquality(z3::context &C,
     }
   };
 
-  accumulate_values(SrcStringMap, SrcZ3Map, SrcPhiMap, src_blocks, src_values);
-  accumulate_values(TgtStringMap, TgtZ3Map, TgtPhiMap, tgt_blocks, tgt_values);
+  accumulate_values(SrcStringMap, SrcZ3Map, SrcPhiMap, src_blocks, {}, src_values);
+  accumulate_values(TgtStringMap, TgtZ3Map, TgtPhiMap, tgt_blocks, tgt_phi_hint, tgt_values);
   add_return_value(SrcRetMap, src_blocks, src_values);
   add_return_value(TgtRetMap, tgt_blocks, tgt_values);
 

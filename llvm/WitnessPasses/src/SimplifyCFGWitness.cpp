@@ -1,6 +1,6 @@
 #include "z3++.h"
 
-#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
@@ -41,26 +41,9 @@ using namespace llvm;
 
 namespace {
 
-using StringRefVec = SmallVector<StringRef, 4>;
+using StringVec = SmallVector<std::string, 4>;
 
 } // end anonymous namespace
-
-namespace llvm {
-template <> struct DenseMapInfo<StringRefVec> {
-  static inline StringRefVec getEmptyKey() {
-    return StringRefVec{DenseMapInfo<StringRef>::getEmptyKey()};
-  }
-  static inline StringRefVec getTombstoneKey() {
-    return StringRefVec{DenseMapInfo<StringRef>::getTombstoneKey()};
-  }
-  static unsigned getHashValue(const StringRefVec &V) {
-    return hash_combine_range(V.begin(), V.end());
-  }
-  static bool isEqual(const StringRefVec &LHS, const StringRefVec &RHS) {
-    return LHS == RHS;
-  }
-};
-} // namespace llvm
 
 namespace {
 
@@ -414,18 +397,98 @@ static void dumpBlockZ3ValueMap(Function &F, const Z3BlockMap &Map,
 
 } // namespace
 
-// Forward declaration for our custom simplifyCFG
+/// Helper function to print witness mappings
+static void printWitnessMappings(const StringMap<SmallVector<std::string, 4>> &witnessMap) {
+  for (const auto &Entry : witnessMap) {
+    errs() << "src_block: " << Entry.first() << " -> {";
+    for (size_t i = 0; i < Entry.second.size(); ++i) {
+      errs() << Entry.second[i];
+      if (i + 1 < Entry.second.size())
+        errs() << ", ";
+    }
+    errs() << "}\n";
+  }
+}
+
+/// Compute transitive closure of block mappings
+/// If A->B and B->C, then add A->C
+static void computeTransitiveClosure(StringMap<SmallVector<std::string, 4>> &witnessMap) {
+  errs() << "\n=== Computing Transitive Closure ===\n";
+  
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    
+    for (auto &[src, tgts] : witnessMap) {
+      // Collect existing targets for membership checking
+      SmallVector<std::string, 8> existingTargets(tgts.begin(), tgts.end());
+      SmallVector<std::string, 4> newTransitiveTargets;
+      
+      for (const std::string &tgt : tgts) {
+        // If tgt also has mappings, add those to src's mappings
+        auto it = witnessMap.find(tgt);
+        if (it != witnessMap.end()) {
+          for (const std::string &transitive : it->second) {
+            // Check if this mapping already exists for src
+            if (llvm::find(existingTargets, transitive) == existingTargets.end()) {
+              newTransitiveTargets.push_back(transitive);
+              existingTargets.push_back(transitive);
+              errs() << "  Adding transitive: " << src << " -> " << tgt 
+                     << " -> " << transitive << "\n";
+              changed = true;
+            }
+          }
+        }
+      }
+      
+      // Append new transitive targets to the source's target list
+      if (!newTransitiveTargets.empty()) {
+        tgts.append(newTransitiveTargets.begin(), newTransitiveTargets.end());
+      }
+    }
+  }
+  
+  errs() << "=== Transitive Closure Complete ===\n\n";
+}
+
+/// Capture all successors of a basic block at a point in time
+static SmallPtrSet<BasicBlock *, 4> captureBlockSuccessors(BasicBlock *BB) {
+  SmallPtrSet<BasicBlock *, 4> Succs;
+  for (auto *Succ : successors(BB))
+    Succs.insert(Succ);
+  return Succs;
+}
+
+/// Check which successors were deleted since the capture
+/// Returns a vector of blocks that were successors before but are no longer
+static SmallVector<BasicBlock *, 4> getDeletedSuccessors(
+    BasicBlock *BB, const SmallPtrSet<BasicBlock *, 4> &OriginalSuccs) {
+  SmallVector<BasicBlock *, 4> Deleted;
+  for (auto *Succ : OriginalSuccs) {
+    if (!is_contained(successors(BB), Succ)) {
+      Deleted.push_back(Succ);
+    }
+  }
+  return Deleted;
+}
+
+// Global witness tracking variables
 namespace witness {
+
+SmallVector<std::string, 16> *g_deadBlocks = nullptr;
+StringMap<SmallVector<std::string, 4>> *g_witnessOneToMany = nullptr;
 
 bool simplifyCFG(BasicBlock *BB, const TargetTransformInfo &TTI,
                  DomTreeUpdater *DTU, const SimplifyCFGOptions &Options,
                  ArrayRef<WeakVH> LoopHeaders);
-}
+
+} // namespace witness
 
 // ===== Copied SimplifyCFG implementation =====
 
 static bool
 performBlockTailMerging(Function &F, ArrayRef<BasicBlock *> BBs,
+                        StringMap<SmallVector<std::string, 4>> &witnessOneToMany,
                         std::vector<DominatorTree::UpdateType> *Updates) {
   SmallVector<PHINode *, 1> NewOps;
 
@@ -465,10 +528,16 @@ performBlockTailMerging(Function &F, ArrayRef<BasicBlock *> BBs,
     else
       CommonDebugLoc =
           DebugLoc::getMergedLocation(CommonDebugLoc, Term->getDebugLoc());
-
+    
     Instruction *BI = BranchInst::Create(CanonicalBB, BB);
+
     BI->setDebugLoc(Term->getDebugLoc());
     Term->eraseFromParent();
+
+    // Record the witness mapping: source block maps to newly target block that was split off from it
+    std::string SourceName = BB->getName().str();
+    witnessOneToMany[SourceName].push_back(CanonicalBB->getName().str());
+    witnessOneToMany[SourceName].push_back(BB->getName().str()); // Also include the original block as a mapping to itself
 
     if (Updates)
       Updates->push_back({DominatorTree::Insert, BB, CanonicalBB});
@@ -483,7 +552,7 @@ performBlockTailMerging(Function &F, ArrayRef<BasicBlock *> BBs,
 
 static bool tailMergeBlocksWithSimilarFunctionTerminators(
     Function &F, DomTreeUpdater *DTU,
-    DenseMap<StringRef, StringRefVec> &witnessOneToMany) {
+    StringMap<SmallVector<std::string, 4>> &witnessOneToMany) {
   (void)witnessOneToMany;
   SmallMapVector<unsigned, SmallVector<BasicBlock *, 2>, 4> Structure;
 
@@ -524,7 +593,7 @@ static bool tailMergeBlocksWithSimilarFunctionTerminators(
   }
 
   for (ArrayRef<BasicBlock *> BBs : make_second_range(Structure))
-    Changed |= performBlockTailMerging(F, BBs, DTU ? &Updates : nullptr);
+    Changed |= performBlockTailMerging(F,  BBs, witnessOneToMany, DTU ? &Updates : nullptr);
 
   if (DTU)
     DTU->applyUpdates(Updates);
@@ -575,7 +644,7 @@ static bool iterativelySimplifyCFG(Function &F, const TargetTransformInfo &TTI,
 static bool
 simplifyFunctionCFGImpl(Function &F, const TargetTransformInfo &TTI,
                         DominatorTree *DT, const SimplifyCFGOptions &Options,
-                        DenseMap<StringRef, StringRefVec> &witnessOneToMany,
+                        StringMap<SmallVector<std::string, 4>> &witnessOneToMany,
                         SmallVector<std::string, 16> &deadBlocks) {
   (void)witnessOneToMany;
   DomTreeUpdater DTU(DT, DomTreeUpdater::UpdateStrategy::Eager);
@@ -595,15 +664,21 @@ simplifyFunctionCFGImpl(Function &F, const TargetTransformInfo &TTI,
 
     for (const auto &Entry : BlocksBefore) {
       if (!BlocksAfter.count(Entry.first)) {
+        errs() << "Deleted block 665: " << Entry.second << "\n";
         deadBlocks.push_back(Entry.second);
       }
     }
   }
 
-    EverChanged |= tailMergeBlocksWithSimilarFunctionTerminators(
+  
+    bool TailMergeChanged = tailMergeBlocksWithSimilarFunctionTerminators(
       F, DT ? DTUPtr : nullptr, witnessOneToMany);
 
-  EverChanged |= iterativelySimplifyCFG(F, TTI, DT ? DTUPtr : nullptr, Options);
+  bool IterChanged = iterativelySimplifyCFG(F, TTI, DT ? DTUPtr : nullptr, Options);
+
+  
+  EverChanged |= TailMergeChanged;
+  EverChanged |= IterChanged;
 
   if (!EverChanged)
     return false;
@@ -623,7 +698,7 @@ simplifyFunctionCFGImpl(Function &F, const TargetTransformInfo &TTI,
 static bool
 simplifyFunctionCFG(Function &F, const TargetTransformInfo &TTI,
                     DominatorTree *DT, const SimplifyCFGOptions &Options,
-                    DenseMap<StringRef, StringRefVec> &witnessOneToMany,
+                    StringMap<SmallVector<std::string, 4>> &witnessOneToMany,
                     SmallVector<std::string, 16> &deadBlocks) {
   return simplifyFunctionCFGImpl(F, TTI, DT, Options, witnessOneToMany,
                                  deadBlocks);
@@ -649,20 +724,59 @@ PreservedAnalyses SimplifyCFGWitness::run(Function &F,
   CFGMappingWitness::initialize(&F, &SymCtx);
   CFGMappingWitness::buildSourceMappings();
 
-  DenseMap<StringRef, StringRefVec> witnessOneToMany;
-  witnessOneToMany["entry"].push_back("entry");
-  witnessOneToMany["merge"].push_back("entry");
-  witnessOneToMany["if_true"].push_back("if_true");
-  witnessOneToMany["if_true"].push_back("common.ret");
-  witnessOneToMany["if_false"].push_back("if_false");
-  witnessOneToMany["if_false"].push_back("common.ret");
+  // Capture original block names before transformation
+  SmallDenseSet<StringRef, 16> originalBlockNames;
+  for (BasicBlock &BB : F) {
+    if (BB.hasName()) {
+      originalBlockNames.insert(BB.getName());
+    }
+  }
 
+  // Initialize global witness tracking pointers
+  StringMap<SmallVector<std::string, 4>> witnessOneToMany;
+
+  
   SmallVector<std::string, 16> deadBlocks;
+  
+  witness::g_witnessOneToMany = &witnessOneToMany;
+  witness::g_deadBlocks = &deadBlocks;
+
   errs() << "Calling simplifyFunctionCFG...\n";
+  
   bool Changed =
       simplifyFunctionCFG(F, TTI, DT, Options, witnessOneToMany, deadBlocks);
-  errs() << "simplifyFunctionCFG returned, Changed=" << Changed << "\n";
 
+
+  errs() << "\n=== Interim Witness Mapping (After Transitive Closure) ===\n";
+  printWitnessMappings(witnessOneToMany);
+  for (const auto &Dead : deadBlocks) {
+    errs() << "Deleted block: " << Dead << "\n";
+  }
+ 
+  // Compute transitive closure: if A->B and B->C, then add A->C
+  computeTransitiveClosure(witnessOneToMany);
+  
+  // Add preserved block mappings: if block A existed in source and has no mapping, add A->A
+  errs() << "\n=== Adding Preserved Block Mappings ===\n";
+  for (BasicBlock &BB : F) {
+    if (!BB.hasName())
+      continue;
+    StringRef blockName = BB.getName();
+    auto it = witnessOneToMany.find(blockName);
+    if (it == witnessOneToMany.end()) {
+      // Check if this block existed in the original block set (O(1) lookup)
+      if (originalBlockNames.contains(blockName)) {
+        // Block existed in source and has no mapping, it was preserved as-is
+        std::string StableBlockName = blockName.str();
+        witnessOneToMany[StableBlockName].push_back(StableBlockName);
+        errs() << "  Preserved: " << blockName << " -> " << blockName << "\n";
+      }
+    }
+  }
+  
+  errs() << "\n=== Final Witness Mapping (After Transitive Closure) ===\n";
+  printWitnessMappings(witnessOneToMany);
+  
   // ===== CAPTURE TARGET STATE =====
   errs() << "\n=== Capturing Target CFG State After Transformation ===\n";
   CFGMappingWitness::buildTargetMappings();
@@ -670,6 +784,10 @@ PreservedAnalyses SimplifyCFGWitness::run(Function &F,
   // Pass static CFGMappingWitness reference to generateWitness
   CFGMappingWitness dummyWitness; // Placeholder since we use static methods
   generateWitness(F, dummyWitness, witnessOneToMany, deadBlocks, SymCtx);
+
+  // Clear global witness tracking pointers
+  witness::g_witnessOneToMany = nullptr;
+  witness::g_deadBlocks = nullptr;
 
   // Release Z3 expressions before SymCtx is destroyed.
   CFGMappingWitness::clear();
@@ -683,7 +801,7 @@ PreservedAnalyses SimplifyCFGWitness::run(Function &F,
 /// Uses explicit block mapping to verify transformation soundness
 void SimplifyCFGWitness::generateWitness(
     Function &F, CFGMappingWitness &CFGWitness,
-    DenseMap<StringRef, StringRefVec> &witnessOneToMany,
+    StringMap<SmallVector<std::string, 4>> &witnessOneToMany,
     ArrayRef<std::string> deadNames, z3::context &SymCtx) {
   errs() << "\n=== INTEGRATED SIMPLIFY-CFG WITNESS VALIDATION ===\n";
 
@@ -719,41 +837,37 @@ void SimplifyCFGWitness::generateWitness(
   // This is the initial witness produced by the transformation.
   // ==========================================================
   errs() << "\n=== Step 2A: One-to-Many Witness ===\n";
-  for (const auto &[src, tgts] : witnessOneToMany) {
-    errs() << "  " << src << " -> {";
-    for (size_t i = 0; i < tgts.size(); ++i) {
-      errs() << tgts[i];
-      if (i + 1 < tgts.size())
-        errs() << ", ";
-    }
-    errs() << "}\n";
-  }
-
+  
+  printWitnessMappings(witnessOneToMany);
   // ==========================================================
   // STEP 2B: PROCESS INTO MANY-TO-MANY CLUSTERS
   // Group sources that map to the same target set into clusters.
   // Maps: vector<src blocks> -> vector<tgt blocks>
   // This automatically handles merges (many src -> one tgt).
   // ==========================================================
-  DenseMap<StringRefVec, StringRefVec> many_to_many;
-  DenseMap<StringRefVec, StringRefVec> temp_map;
+  std::map<std::vector<std::string>, std::vector<std::string>> many_to_many;
+  std::map<std::vector<std::string>, std::vector<std::string>> temp_map;
 
-  auto normalize_set = [](const StringRefVec &In) {
-    StringRefVec Out(In.begin(), In.end());
+  auto normalize_set = [](const StringVec &In) {
+    StringVec Out(In.begin(), In.end());
     llvm::sort(Out);
     Out.erase(std::unique(Out.begin(), Out.end()), Out.end());
     return Out;
   };
 
-  for (const auto &[src, tgts] : witnessOneToMany) {
-    StringRefVec norm_tgts = normalize_set(tgts);
-    temp_map[norm_tgts].push_back(src);
+  for (const auto &Entry : witnessOneToMany) {
+    StringVec norm_tgts = normalize_set(Entry.second);
+    std::vector<std::string> tgts_key(norm_tgts.begin(), norm_tgts.end());
+    temp_map[tgts_key].push_back(Entry.first().str());
   }
 
   for (const auto &[tgts, srcs] : temp_map) {
-    StringRefVec norm_srcs = normalize_set(srcs);
-    StringRefVec norm_tgts = normalize_set(tgts);
-    many_to_many[norm_srcs] = norm_tgts;
+    StringVec srcs_vec(srcs.begin(), srcs.end());
+    StringVec tgts_vec(tgts.begin(), tgts.end());
+    StringVec norm_srcs = normalize_set(srcs_vec);
+    StringVec norm_tgts = normalize_set(tgts_vec);
+    many_to_many[std::vector<std::string>(norm_srcs.begin(), norm_srcs.end())] =
+        std::vector<std::string>(norm_tgts.begin(), norm_tgts.end());
   }
 
   errs() << "\n=== Step 2B: Many-to-Many Clusters ===\n";
@@ -793,17 +907,10 @@ void SimplifyCFGWitness::generateWitness(
   // Source block state: only include variables actually COMPUTED in that block
   // (not passed through from predecessors)
 
-  auto reach_src_set = [&](const StringRefVec &Set) {
+  auto reach_src_set = [&](ArrayRef<std::string> Set) {
     z3::expr cond = c.bool_val(false);
-    for (StringRef S : Set)
-      cond = cond && lookup_src_cond(S);
-    return cond;
-  };
-
-  auto reach_tgt_set = [&](const StringRefVec &Set) {
-    z3::expr cond = c.bool_val(false);
-    for (StringRef T : Set)
-      cond = cond && lookup_tgt_cond(T);
+    for (const std::string &S : Set)
+      cond = cond || lookup_src_cond(S);
     return cond;
   };
 
@@ -839,30 +946,77 @@ void SimplifyCFGWitness::generateWitness(
     }
     errs() << "}\n";
 
-    // Path-condition equivalence for this cluster.
-    z3::expr src_pc = reach_src_set(srcs);
-    z3::expr tgt_pc = reach_tgt_set(tgts);
+    bool isSplit = srcs.size() == 1 && tgts.size() > 1;
 
-    // z3::expr pc_vc = implies(tgt_pc, src_pc);
-    // errs() << Z3_ast_to_string(c, pc_vc);
-    // path_checking.push_back(pc_vc);
+    if (isSplit) {
+      // For SPLIT clusters: the source block was split into multiple target
+      // blocks. Separate "new" target blocks (created by the transformation,
+      // not present in source) from "preserved" ones.
+      // Check state equality conditioned on reaching each new target block,
+      // comparing the source block's values against that specific new target.
+      std::vector<std::string> newTgts;
+      std::vector<std::string> preservedTgts;
+      for (const std::string &tgt : tgts) {
+        if (src_conditions.count(tgt) == 0)
+          newTgts.push_back(tgt);
+        else
+          preservedTgts.push_back(tgt);
+      }
 
-    z3::expr state_eq_vc =
-        CFGMappingWitness::buildCommonVariableEquality(c, srcs, tgts);
-    errs() << "State_checking for block" << Z3_ast_to_string(c, state_eq_vc);
-    state_checking.push_back(state_eq_vc);
+      errs() << "  SPLIT: new targets = {";
+      for (size_t i = 0; i < newTgts.size(); ++i) {
+        errs() << newTgts[i];
+        if (i + 1 < newTgts.size()) errs() << ", ";
+      }
+      errs() << "}, preserved = {";
+      for (size_t i = 0; i < preservedTgts.size(); ++i) {
+        errs() << preservedTgts[i];
+        if (i + 1 < preservedTgts.size()) errs() << ", ";
+      }
+      errs() << "}\n";
+
+      // For each new target block, check: when we reach it in the target,
+      // its values match the source block's values.
+      // Pass srcs as the PHI hint so that PHI nodes in the new target
+      // (e.g. common.ret.op = phi[12, if_true],[14, if_false]) are resolved
+      // using the source block as the incoming predecessor.
+      for (const std::string &newTgt : newTgts) {
+        z3::expr tgt_pc = lookup_tgt_cond(newTgt);
+        std::vector<std::string> singleTgt = {newTgt};
+        z3::expr state_eq_vc =
+            CFGMappingWitness::buildCommonVariableEquality(c, srcs, singleTgt, srcs);
+        errs() << "  SPLIT state_checking (src vs " << newTgt << "): "
+               << Z3_ast_to_string(c, state_eq_vc) << "\n";
+        state_checking.push_back(z3::implies(tgt_pc, state_eq_vc));
+      }
+      // Preserved blocks in a SPLIT only contain control flow; the actual
+      // computation moved into the new blocks, so no state check needed.
+    } else {
+      // For MERGE and ONE-TO-ONE: condition on source cluster reachability.
+      z3::expr src_pc = reach_src_set(srcs);
+      z3::expr state_eq_vc =
+          CFGMappingWitness::buildCommonVariableEquality(c, srcs, tgts);
+      errs() << "State_checking for block" << Z3_ast_to_string(c, state_eq_vc);
+      state_checking.push_back(z3::implies(src_pc, state_eq_vc));
+    }
   }
 
   // ==========================================================
   // STEP 4: GLOBAL EXIT CHECK (Completeness)
-  // Source: if_true and if_false are exit blocks
-  // Target: common.ret is the sole exit block
-  // Ensures total reachability is preserved at exit.
+  // Dynamically compute which blocks are exit blocks (Ret/Unreachable)
+  // and check that total exit reachability is preserved.
   // ==========================================================
-  z3::expr total_src_exit =
-      lookup_src_cond("if_true") || lookup_src_cond("if_false");
-  z3::expr total_tgt_exit = lookup_tgt_cond("common.ret");
-  path_checking.push_back(total_tgt_exit == total_src_exit);
+  z3::expr total_src_exit = c.bool_val(false);
+  z3::expr total_tgt_exit = c.bool_val(false);
+  for (const auto &KV : src_conditions) {
+    total_src_exit = total_src_exit || KV.second;
+  }
+  for (const auto &KV : tgt_conditions) {
+    total_tgt_exit = total_tgt_exit || KV.second;
+  }
+  if (!src_conditions.empty() || !tgt_conditions.empty())
+    path_checking.push_back(total_tgt_exit == total_src_exit);
+
   z3::expr_vector dead_block_vec(c);
   // Dead-block reachability: not (pc(block1) or pc(block2) ...).
   for (const std::string &Dead : deadNames) {
@@ -879,13 +1033,13 @@ void SimplifyCFGWitness::generateWitness(
   // STEP 5: Z3 VERIFICATION
   // ==========================================================
 
-  // errs() << "\n" << "state_checking" << Z3_ast_to_string(c,
-  // z3::mk_and(state_checking) ) << "\n"; errs() << "path_checking"
-  // <<Z3_ast_to_string(c, z3::mk_and(path_checking)) << "\n";
+  // Guard against empty vectors (mk_and on empty = bare "and" in Z3)
+  z3::expr path_part = path_checking.empty() ? c.bool_val(true) : z3::mk_and(path_checking);
+  z3::expr state_part = state_checking.empty() ? c.bool_val(true) : z3::mk_and(state_checking);
+  z3::expr dead_part = dead_block_vec.empty() ? c.bool_val(true) : z3::mk_and(dead_block_vec);
 
-  z3::expr final_vc = z3::mk_and(path_checking) && z3::mk_and(state_checking) &&
-                      z3::mk_and(dead_block_vec);
-  final_vc.simplify();
+  z3::expr final_vc = path_part && state_part && dead_part;
+  final_vc = final_vc.simplify();
 
   // Display the VC for debugging
   errs() << "Generated Verification Condition:\n"
@@ -910,5 +1064,3 @@ void SimplifyCFGWitness::generateWitness(
     }
   }
 }
-
-/*hi*/

@@ -1,7 +1,10 @@
 cmake_minimum_required(VERSION 3.16)
 project(WitnessPasses LANGUAGES CXX)
 
-set(LLVM_DIR "/usr/local/llvm-21/lib/cmake/llvm")
+set(LLVM_DIR "/workspaces/codespaces-blank/llvm-project/build/lib/cmake/llvm")
+
+# Find Z3
+find_package(Z3 REQUIRED)
 
 # Add the plugin
 add_llvm_pass_plugin(WitnessPasses
@@ -22,4 +25,8 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 target_include_directories(WitnessPasses PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${Z3_INCLUDE_DIR}
 )
+
+# Link Z3 library
+target_link_libraries(WitnessPasses PRIVATE ${Z3_LIBRARIES})

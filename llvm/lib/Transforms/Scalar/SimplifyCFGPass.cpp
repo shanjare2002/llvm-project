@@ -421,33 +421,42 @@ LLVM_ABI PreservedAnalyses SimplifyCFGPass::run(Function &F,
 
   errs() << "\n=== SimplifyCFG: Changes were made ===\n";
 
+  // Collect surviving blocks to avoid dangling pointer dereference.
+  SmallPtrSet<BasicBlock *, 16> SurvivingBlocks;
+  for (BasicBlock &BB : F)
+    SurvivingBlocks.insert(&BB);
+
   // After the pass, record identity mappings for blocks that weren't merged
+  // and still survive.
   for (BasicBlock *BB : AllBlocksBefore) {
-    if (blockMap.find(BB) == blockMap.end()) {
-      // Block wasn't merged, so it maps to itself (if not deleted)
+    if (SurvivingBlocks.count(BB) && blockMap.find(BB) == blockMap.end()) {
+      // Block wasn't merged, so it maps to itself.
       blockMap[BB] = BB;
     }
   }
 
-  // Log the block mapping
+  // Log the block mapping — only dereference surviving blocks.
   errs() << "\n=== SimplifyCFG Block Mapping ===\n";
   for (BasicBlock *SourceBB : AllBlocksBefore) {
-    if (blockMap.count(SourceBB)) {
-      BasicBlock *TargetBB = blockMap[SourceBB];
-      errs() << "  ";
-      if (SourceBB->hasName())
-        errs() << SourceBB->getName();
-      else
-        errs() << "block_" << SourceBB;
-      errs() << " -> ";
-      if (TargetBB->hasName())
-        errs() << TargetBB->getName();
-      else
-        errs() << "block_" << TargetBB;
-      if (TargetBB != SourceBB)
-        errs() << " (MERGED)";
-      errs() << "\n";
-    }
+    if (!blockMap.count(SourceBB))
+      continue;
+    BasicBlock *TargetBB = blockMap[SourceBB];
+    // Skip if either pointer is no longer alive.
+    if (!SurvivingBlocks.count(SourceBB) || !SurvivingBlocks.count(TargetBB))
+      continue;
+    errs() << "  ";
+    if (SourceBB->hasName())
+      errs() << SourceBB->getName();
+    else
+      errs() << "block_" << SourceBB;
+    errs() << " -> ";
+    if (TargetBB->hasName())
+      errs() << TargetBB->getName();
+    else
+      errs() << "block_" << TargetBB;
+    if (TargetBB != SourceBB)
+      errs() << " (MERGED)";
+    errs() << "\n";
   }
   errs() << "==================================\n\n";
 

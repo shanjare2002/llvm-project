@@ -77,6 +77,7 @@
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/LockstepReverseIterator.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
+
 #include <algorithm>
 #include <cassert>
 #include <climits>
@@ -90,10 +91,39 @@
 #include <utility>
 #include <vector>
 
+// Remove the local static versions and provide shared definitions:
+namespace llvm {
+
+SmallPtrSet<BasicBlock *, 4> captureBlockSuccessors(BasicBlock *BB) {
+  SmallPtrSet<BasicBlock *, 4> Succs;
+  for (auto *Succ : successors(BB))
+    Succs.insert(Succ);
+  return Succs;
+}
+
+SmallVector<BasicBlock *, 4>
+getDeletedSuccessors(BasicBlock *BB,
+                     const SmallPtrSet<BasicBlock *, 4> &OriginalSuccs) {
+  SmallVector<BasicBlock *, 4> Deleted;
+  for (auto *Succ : OriginalSuccs) {
+    if (!is_contained(successors(BB), Succ))
+      Deleted.push_back(Succ);
+  }
+  return Deleted;
+}
+
+} // namespace llvm
+
 using namespace llvm;
 using namespace PatternMatch;
 
 #define DEBUG_TYPE "simplifycfg"
+
+// External declarations for global witness tracking variables
+namespace witness {
+extern SmallVector<std::string, 16> *g_deadBlocks;
+extern StringMap<SmallVector<std::string, 4>> *g_witnessOneToMany;
+} // namespace witness
 
 // Static configuration constants (no command-line options to avoid conflicts)
 namespace {
@@ -1794,6 +1824,12 @@ bool SimplifyCFGOpt::hoistCommonCodeFromSuccessors(Instruction *TI,
     // Now we know that all instructions in all successors can be hoisted. Let
     // the loop below handle the hoisting.
   }
+  for (auto *succ : successors(BB)){
+      std::string Succ= succ->getName().str();
+      StringRef SuccName = Succ;
+      StringRef BBName = BB->getName();
+      (*witness::g_witnessOneToMany)[SuccName].push_back(BBName.str());
+  }
 
   // Count how many instructions were not hoisted so far. There's a limit on how
   // many instructions we skip, serving as a compilation time control as well as
@@ -2339,7 +2375,7 @@ static bool sinkCommonCodeFromPredecessors(BasicBlock *BB,
     for (BasicBlock *Pred : UnconditionalPreds)
       Ops.push_back(*IncomingVals[Pred]);
   }
-
+  
   int ScanIdx = 0;
   SmallPtrSet<Value *, 4> InstructionsToSink;
   LockstepReverseIterator<true> LRI(UnconditionalPreds);
@@ -7737,6 +7773,7 @@ static bool tryToMergeLandingPad(LandingPadInst *LPad, BranchInst *BI,
 }
 
 bool SimplifyCFGOpt::simplifyBranch(BranchInst *Branch, IRBuilder<> &Builder) {
+
   return Branch->isUnconditional() ? simplifyUncondBranch(Branch, Builder)
                                    : simplifyCondBranch(Branch, Builder);
 }
@@ -7958,8 +7995,10 @@ bool SimplifyCFGOpt::simplifyCondBranch(BranchInst *BI, IRBuilder<> &Builder) {
   if (BI->getSuccessor(0)->getSinglePredecessor()) {
     if (BI->getSuccessor(1)->getSinglePredecessor()) {
       if (HoistCommon &&
-          hoistCommonCodeFromSuccessors(BI, !Options.HoistCommonInsts))
-        return requestResimplify();
+          hoistCommonCodeFromSuccessors(BI, !Options.HoistCommonInsts)){
+            errs() <<"Hoisted common code from successors of ";
+          return requestResimplify();
+          }
 
       if (BI && Options.HoistLoadsStoresWithCondFaulting &&
           isProfitableToSpeculate(BI, std::nullopt, TTI)) {
@@ -8243,6 +8282,8 @@ static bool removeUndefIntroducingPredecessor(BasicBlock *BB,
 }
 
 bool SimplifyCFGOpt::simplifyOnce(BasicBlock *BB) {
+
+
   bool Changed = false;
 
   assert(BB && BB->getParent() && "Block not embedded in function!");
@@ -8254,32 +8295,94 @@ bool SimplifyCFGOpt::simplifyOnce(BasicBlock *BB) {
   if ((pred_empty(BB) && BB != &BB->getParent()->getEntryBlock()) ||
       BB->getSinglePredecessor() == BB) {
     LLVM_DEBUG(dbgs() << "Removing BB: \n" << *BB);
+
+    if (witness::g_deadBlocks){
+      std::string Name = BB->getName().str();
+      if (witness::g_witnessOneToMany) {
+        errs() << "Current witness mappings:\n";
+        for (const auto &Entry : *witness::g_witnessOneToMany) {
+          errs() << "  " << Entry.first() << " -> [";
+          for (size_t i = 0; i < Entry.second.size(); ++i) {
+            errs() << Entry.second[i];
+            if (i + 1 < Entry.second.size()) errs() << ", ";
+          }
+          errs() << "]\n";
+        }
+      }
+      // Only track as dead if this block has no witness mapping
+      bool InWitnessMap = witness::g_witnessOneToMany &&
+                          witness::g_witnessOneToMany->count(Name) > 0;
+      if (!InWitnessMap){
+        errs() << "Adding block " << Name << " to dead blocks\n";
+
+        witness::g_deadBlocks->push_back(Name);
+      }
+    }
     DeleteDeadBlock(BB, DTU);
     return true;
   }
 
   // Check to see if we can constant propagate this terminator
   // instruction away...
+  
+  // Capture successors before folding to track deleted branches
+  SmallPtrSet<BasicBlock *, 4> OriginalSuccessors = captureBlockSuccessors(BB);
+  
   Changed |= ConstantFoldTerminator(BB, /*DeleteDeadConditions=*/true,
                                     /*TLI=*/nullptr, DTU);
-
-  // Check for and eliminate duplicate PHI nodes in this block.
+  
+  // Check which branches were deleted after constant folding
+  if (Changed && !OriginalSuccessors.empty()) {
+       SmallVector<BasicBlock *, 4> DeletedBranches = getDeletedSuccessors(BB, OriginalSuccessors);
+       if (witness::g_deadBlocks) {
+         errs() << "Deleted branches from block " << 8317;
+         for (BasicBlock *DeletedBranch : DeletedBranches) {
+           std::string Name = DeletedBranch->getName().str();
+           // Only track as dead if this block has no witness mapping
+           bool InWitnessMap = witness::g_witnessOneToMany &&
+                               witness::g_witnessOneToMany->count(Name) > 0;
+           if (!InWitnessMap)
+             witness::g_deadBlocks->push_back(Name);
+         }
+       }
+  }
+ 
+  // Check for and eliminate duplicate PHI nodes in this block. Ask Soham
   Changed |= EliminateDuplicatePHINodes(BB);
 
   // Check for and remove branches that will always cause undefined
   // behavior.
+
+  //look into this later. Ask Soham.
   if (removeUndefIntroducingPredecessor(BB, DTU, Options.AC))
     return requestResimplify();
 
   // Merge basic blocks into their predecessor if there is only one
   // distinct pred, and if there is only one distinct successor of
   // the predecessor, and if there are no PHI nodes.
-  if (mergeBlockIntoPredecessorIfPossible(BB))
-    return true;
+    StringRef BBName = BB->getName();
+    StringRef PredName = "";
+    if (BB->getSinglePredecessor()) {
+       BasicBlock *Pred = BB->getSinglePredecessor();
+       PredName = Pred->getName();
+    }
+    if (mergeBlockIntoPredecessorIfPossible(BB)) {
+      if (witness::g_witnessOneToMany) {
+        errs() << "merging block " << BBName << " into its predecessor " << PredName << "\n";
+        (*witness::g_witnessOneToMany)[BBName].push_back(PredName.str());
+        for (const auto &entry : (*witness::g_witnessOneToMany)[BBName]) {
+           errs() << "  " << entry << "\n";
+        }
 
+      }
+    return true;
+   }
+    
+  BBName = BB->getName();
   if (SinkCommon && Options.SinkCommonInsts)
     if (sinkCommonCodeFromPredecessors(BB, DTU) ||
         mergeCompatibleInvokes(BB, DTU)) {
+      errs() << BBName << ": sinking common code from predecessors or merging compatible invokes\n";
       // sinkCommonCodeFromPredecessors() does not automatically CSE
       // PHI's, so we may now how duplicate PHI's. Let's rerun
       // EliminateDuplicatePHINodes() first, before
@@ -8306,6 +8409,7 @@ bool SimplifyCFGOpt::simplifyOnce(BasicBlock *BB) {
   Builder.SetInsertPoint(Terminator);
   switch (Terminator->getOpcode()) {
   case Instruction::Br:
+    errs() << "simplifying branch in block " << BB->getName() << "\n";
     Changed |= simplifyBranch(cast<BranchInst>(Terminator), Builder);
     break;
   case Instruction::Resume:
@@ -8329,7 +8433,7 @@ bool SimplifyCFGOpt::simplifyOnce(BasicBlock *BB) {
 }
 
 bool SimplifyCFGOpt::run(BasicBlock *BB) {
-  errs() << "checking" << BB->getName() << "\n";
+  errs() << "checking block witness" << BB->getName() << "\n";
   bool Changed = false;
 
   // Repeated simplify BB as long as resimplification is requested.

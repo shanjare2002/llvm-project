@@ -122,8 +122,9 @@ public:
   /// Uses cached source/target block mappings and preserves equality between
   /// common variables.
   static z3::expr buildCommonVariableEquality(z3::context &C,
-                                              const StringRefVec &src_blocks,
-                                              const StringRefVec &tgt_blocks);
+                                              ArrayRef<std::string> src_blocks,
+                                              ArrayRef<std::string> tgt_blocks,
+                                              ArrayRef<std::string> tgt_phi_hint = {});
 
 private:
   static Function *F;
