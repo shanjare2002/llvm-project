@@ -247,10 +247,10 @@ z3::expr CFGMappingWitness::computeInstructionExprZ3(
   }
 
   if (auto *SI = dyn_cast<SelectInst>(&I)) {
-    z3::expr ResultVar = makeFreshZ3Expr(&I, C);
+    z3::expr Cond = z3GetExprForValue(SI->getCondition(), C, ValMap);
     z3::expr TVal = z3GetExprForValue(SI->getTrueValue(), C, ValMap);
     z3::expr FVal = z3GetExprForValue(SI->getFalseValue(), C, ValMap);
-    return (ResultVar == TVal) || (ResultVar == FVal);
+    return z3::ite(Cond, TVal, FVal);
   }
 
   if (auto *LI = dyn_cast<LoadInst>(&I)) {

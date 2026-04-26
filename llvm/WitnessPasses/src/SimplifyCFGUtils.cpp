@@ -1824,12 +1824,11 @@ bool SimplifyCFGOpt::hoistCommonCodeFromSuccessors(Instruction *TI,
     // Now we know that all instructions in all successors can be hoisted. Let
     // the loop below handle the hoisting.
   }
-  for (auto *succ : successors(BB)){
-      std::string Succ= succ->getName().str();
-      StringRef SuccName = Succ;
-      StringRef BBName = BB->getName();
-      (*witness::g_witnessOneToMany)[SuccName].push_back(BBName.str());
-  }
+  // Note: we do NOT add witness mappings here. When instructions are hoisted
+  // from successors into BB, both BB and the successors continue to exist in
+  // the target CFG. Identity mappings (Succ->Succ, BB->BB) are added later by
+  // the "preserved block" phase in SimplifyCFGWitness. Adding spurious
+  // Succ->BB mappings creates wrong MERGE clusters that fail state equality.
 
   // Count how many instructions were not hoisted so far. There's a limit on how
   // many instructions we skip, serving as a compilation time control as well as
@@ -8360,29 +8359,26 @@ bool SimplifyCFGOpt::simplifyOnce(BasicBlock *BB) {
   // Merge basic blocks into their predecessor if there is only one
   // distinct pred, and if there is only one distinct successor of
   // the predecessor, and if there are no PHI nodes.
-    StringRef BBName = BB->getName();
-    StringRef PredName = "";
-    if (BB->getSinglePredecessor()) {
-       BasicBlock *Pred = BB->getSinglePredecessor();
-       PredName = Pred->getName();
-    }
+    // Capture names as std::string before any potential deletion (StringRef is
+    // dangling after mergeBlockIntoPredecessorIfPossible erases BB).
+    std::string BBNameStr = BB->hasName() ? BB->getName().str() : std::string("(unnamed)");
+    std::string PredNameStr;
+    if (BasicBlock *Pred = BB->getSinglePredecessor())
+      PredNameStr = Pred->hasName() ? Pred->getName().str() : std::string("(unnamed)");
+
     if (mergeBlockIntoPredecessorIfPossible(BB)) {
       if (witness::g_witnessOneToMany) {
-        errs() << "merging block " << BBName << " into its predecessor " << PredName << "\n";
-        (*witness::g_witnessOneToMany)[BBName].push_back(PredName.str());
-        for (const auto &entry : (*witness::g_witnessOneToMany)[BBName]) {
-           errs() << "  " << entry << "\n";
-        }
-
+        errs() << "merging block " << BBNameStr << " into its predecessor " << PredNameStr << "\n";
+        (*witness::g_witnessOneToMany)[BBNameStr].push_back(PredNameStr);
       }
     return true;
    }
     
-  BBName = BB->getName();
+  BBNameStr = BB->hasName() ? BB->getName().str() : std::string("(unnamed)");
   if (SinkCommon && Options.SinkCommonInsts)
     if (sinkCommonCodeFromPredecessors(BB, DTU) ||
         mergeCompatibleInvokes(BB, DTU)) {
-      errs() << BBName << ": sinking common code from predecessors or merging compatible invokes\n";
+      errs() << BBNameStr << ": sinking common code from predecessors or merging compatible invokes\n";
       // sinkCommonCodeFromPredecessors() does not automatically CSE
       // PHI's, so we may now how duplicate PHI's. Let's rerun
       // EliminateDuplicatePHINodes() first, before
