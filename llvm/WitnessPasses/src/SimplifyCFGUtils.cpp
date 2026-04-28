@@ -8360,25 +8360,26 @@ bool SimplifyCFGOpt::simplifyOnce(BasicBlock *BB) {
   // Merge basic blocks into their predecessor if there is only one
   // distinct pred, and if there is only one distinct successor of
   // the predecessor, and if there are no PHI nodes.
-    StringRef BBName = BB->getName();
-    StringRef PredName = "";
-    if (BB->getSinglePredecessor()) {
-       BasicBlock *Pred = BB->getSinglePredecessor();
-       PredName = Pred->getName();
+  {
+    // Capture names as owned strings BEFORE merge (StringRef becomes invalid
+    // after the block is deleted/merged).
+    std::string BBNameStr = BB->hasName() ? BB->getName().str() : "";
+    std::string PredNameStr;
+    if (BasicBlock *Pred = BB->getSinglePredecessor()) {
+      PredNameStr = Pred->hasName() ? Pred->getName().str() : "(unnamed)";
     }
     if (mergeBlockIntoPredecessorIfPossible(BB)) {
-      if (witness::g_witnessOneToMany) {
-        errs() << "merging block " << BBName << " into its predecessor " << PredName << "\n";
-        (*witness::g_witnessOneToMany)[BBName].push_back(PredName.str());
-        for (const auto &entry : (*witness::g_witnessOneToMany)[BBName]) {
-           errs() << "  " << entry << "\n";
-        }
-
+      if (witness::g_witnessOneToMany && !BBNameStr.empty()) {
+        errs() << "merging block " << BBNameStr << " into its predecessor "
+               << PredNameStr << "\n";
+        if (!PredNameStr.empty())
+          (*witness::g_witnessOneToMany)[BBNameStr].push_back(PredNameStr);
       }
-    return true;
-   }
-    
-  BBName = BB->getName();
+      return true;
+    }
+  }
+
+  StringRef BBName = BB->getName();
   if (SinkCommon && Options.SinkCommonInsts)
     if (sinkCommonCodeFromPredecessors(BB, DTU) ||
         mergeCompatibleInvokes(BB, DTU)) {

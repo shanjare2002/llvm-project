@@ -44,12 +44,12 @@ struct BasicBlockPtrEqual {
 };
 
 // Type alias for Z3 block value mappings: {block_name: {value: z3-expr}}
-using Z3BlockMap = std::map<std::string, std::map<const Value *, z3::expr>>;
+using Z3BlockMap = std::map<std::string, std::map<std::string, z3::expr>>;
 
 // Type alias for string block value mappings: {block_name: {value:
 // string-expr}}
 using StringBlockMap =
-    std::map<std::string, std::map<const Value *, std::string>>;
+    std::map<std::string, std::map<std::string, std::string>>;
 
 // Type alias for PHI incoming mappings: {phi_name: {incoming_block: expr}}
 using PhiIncomingMap = std::map<std::string, std::map<std::string, z3::expr>>;
@@ -156,7 +156,7 @@ private:
   static Z3BlockMap buildBlockZ3ValueMap(PhiIncomingMap *PhiMap,
                                          RetValueMap *RetMap,
                                          RetPhiNameMap *RetPhiMap);
-  static StringBlockMap buildBlockStringValueMap();
+  static StringBlockMap buildBlockStringValueMap(bool isSrc);
   static PathCondMap buildPathCondMap(const Z3BlockMap &Z3Map);
 
   // Static helper functions for expression building

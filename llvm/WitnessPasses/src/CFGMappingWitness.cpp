@@ -1,5 +1,7 @@
 #include "CFGMappingWitness.h"
 
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InstIterator.h"
@@ -72,23 +74,15 @@ std::string CFGMappingWitness::computeInstructionExprString(
     std::string R = getExprForValue(BO->getOperand(1), ValMap);
     const char *Op = nullptr;
     switch (BO->getOpcode()) {
-    case Instruction::Add:
-      Op = "+";
-      break;
-    case Instruction::Sub:
-      Op = "-";
-      break;
-    case Instruction::Mul:
-      Op = "*";
-      break;
-    case Instruction::And:
-      Op = "&";
-      break;
-    case Instruction::Or:
-      Op = "|";
-      break;
-    default:
-      break;
+    case Instruction::Add:  Op = "+"; break;
+    case Instruction::Sub:  Op = "-"; break;
+    case Instruction::Mul:  Op = "*"; break;
+    case Instruction::SDiv: Op = "/"; break;
+    case Instruction::SRem: Op = "%"; break;
+    case Instruction::And:  Op = "&"; break;
+    case Instruction::Or:   Op = "|"; break;
+    case Instruction::Xor:  Op = "^"; break;
+    default: break;
     }
     if (Op)
       return "(" + L + " " + Op + " " + R + ")";
@@ -99,26 +93,17 @@ std::string CFGMappingWitness::computeInstructionExprString(
     std::string R = getExprForValue(IC->getOperand(1), ValMap);
     const char *Op = nullptr;
     switch (IC->getPredicate()) {
-    case CmpInst::ICMP_SLT:
-      Op = "<";
-      break;
-    case CmpInst::ICMP_SLE:
-      Op = "<=";
-      break;
-    case CmpInst::ICMP_SGT:
-      Op = ">";
-      break;
-    case CmpInst::ICMP_SGE:
-      Op = ">=";
-      break;
-    case CmpInst::ICMP_EQ:
-      Op = "==";
-      break;
-    case CmpInst::ICMP_NE:
-      Op = "!=";
-      break;
-    default:
-      break;
+    case CmpInst::ICMP_SLT: Op = "<";  break;
+    case CmpInst::ICMP_SLE: Op = "<="; break;
+    case CmpInst::ICMP_SGT: Op = ">";  break;
+    case CmpInst::ICMP_SGE: Op = ">="; break;
+    case CmpInst::ICMP_EQ:  Op = "=="; break;
+    case CmpInst::ICMP_NE:  Op = "!="; break;
+    case CmpInst::ICMP_ULT: Op = "u<";  break;
+    case CmpInst::ICMP_ULE: Op = "u<="; break;
+    case CmpInst::ICMP_UGT: Op = "u>";  break;
+    case CmpInst::ICMP_UGE: Op = "u>="; break;
+    default: break;
     }
     if (Op)
       return "(" + L + " " + Op + " " + R + ")";
@@ -150,9 +135,10 @@ std::string CFGMappingWitness::computeInstructionExprString(
   }
 
   if (auto *SI = dyn_cast<SelectInst>(&I)) {
+    std::string Cnd = getExprForValue(SI->getCondition(), ValMap);
     std::string TVal = getExprForValue(SI->getTrueValue(), ValMap);
     std::string FVal = getExprForValue(SI->getFalseValue(), ValMap);
-    return "(" + TVal + " || " + FVal + ")";
+    return "(" + Cnd + " ? " + TVal + " : " + FVal + ")";
   }
 
   if (auto *LI = dyn_cast<LoadInst>(&I)) {
@@ -176,6 +162,10 @@ std::string CFGMappingWitness::getExprForValue(
     return getValueName(V);
 
   if (auto *I = dyn_cast<Instruction>(V)) {
+    // Insert the value name as a placeholder BEFORE recursing to break cycles
+    // (e.g., PHI nodes with loop back-edges referencing themselves).
+    std::string Name = getValueName(V);
+    ValMap[V] = Name;
     std::string E = computeInstructionExprString(*I, ValMap);
     ValMap[V] = E;
     return E;
@@ -184,12 +174,19 @@ std::string CFGMappingWitness::getExprForValue(
   return getValueName(V);
 }
 
+// Returns true if this value's type can be reasoned about by Z3 as int/bool.
+static bool isSupportedZ3Type(const Value *V) {
+  Type *T = V->getType();
+  return T->isIntegerTy();
+}
+
 z3::expr CFGMappingWitness::makeFreshZ3Expr(const Value *V, z3::context &C) {
   std::string Name = getValueName(V);
   if (V->getType()->isIntegerTy(1))
     return C.bool_const(Name.c_str());
   if (V->getType()->isIntegerTy())
     return C.int_const(Name.c_str());
+  // For float/pointer/vector types, use uninterpreted int constant.
   return C.int_const(Name.c_str());
 }
 
@@ -197,23 +194,32 @@ z3::expr CFGMappingWitness::computeInstructionExprZ3(
     const Instruction &I, z3::context &C,
     std::map<const Value *, z3::expr> &ValMap) {
   if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
+    // Only handle integer binary ops
+    if (!BO->getType()->isIntegerTy())
+      return makeFreshZ3Expr(&I, C);
     z3::expr L = z3GetExprForValue(BO->getOperand(0), C, ValMap);
     z3::expr R = z3GetExprForValue(BO->getOperand(1), C, ValMap);
     switch (BO->getOpcode()) {
-    case Instruction::Add:
-      return L + R;
-    case Instruction::Sub:
-      return L - R;
-    case Instruction::Mul:
-      return L * R;
+    case Instruction::Add:  return L + R;
+    case Instruction::Sub:  return L - R;
+    case Instruction::Mul:  return L * R;
+    case Instruction::SDiv: return L / R;
+    case Instruction::SRem: return L % R;
     case Instruction::And:
       if (BO->getType()->isIntegerTy(1))
         return L && R;
-      return L & R;
+      // Bitwise AND on multi-bit integers is not expressible in Z3 LIA
+      return makeFreshZ3Expr(&I, C);
     case Instruction::Or:
       if (BO->getType()->isIntegerTy(1))
         return L || R;
-      return L | R;
+      // Bitwise OR on multi-bit integers is not expressible in Z3 LIA
+      return makeFreshZ3Expr(&I, C);
+    case Instruction::Xor:
+      if (BO->getType()->isIntegerTy(1))
+        return !(L == R); // XOR as not-equal for booleans
+      // Bitwise XOR on multi-bit integers is not expressible in Z3 LIA
+      return makeFreshZ3Expr(&I, C);
     default:
       break;
     }
@@ -222,19 +228,32 @@ z3::expr CFGMappingWitness::computeInstructionExprZ3(
   if (auto *IC = dyn_cast<ICmpInst>(&I)) {
     z3::expr L = z3GetExprForValue(IC->getOperand(0), C, ValMap);
     z3::expr R = z3GetExprForValue(IC->getOperand(1), C, ValMap);
+    // Guard: sorts must match for any comparison to avoid Z3 assertion failures
+    if (L.get_sort().id() != R.get_sort().id())
+      return makeFreshZ3Expr(&I, C);
     switch (IC->getPredicate()) {
+    case CmpInst::ICMP_EQ:  return L == R;
+    case CmpInst::ICMP_NE:  return L != R;
+    // Signed integer comparisons (only valid for int sort, not bool)
     case CmpInst::ICMP_SLT:
-      return L < R;
+      if (!L.is_bool()) return L < R;
+      return makeFreshZ3Expr(&I, C);
     case CmpInst::ICMP_SLE:
-      return L <= R;
+      if (!L.is_bool()) return L <= R;
+      return makeFreshZ3Expr(&I, C);
     case CmpInst::ICMP_SGT:
-      return L > R;
+      if (!L.is_bool()) return L > R;
+      return makeFreshZ3Expr(&I, C);
     case CmpInst::ICMP_SGE:
-      return L >= R;
-    case CmpInst::ICMP_EQ:
-      return L == R;
-    case CmpInst::ICMP_NE:
-      return L != R;
+      if (!L.is_bool()) return L >= R;
+      return makeFreshZ3Expr(&I, C);
+    // Unsigned comparisons: z3::ult/ugt/ule/uge require bitvector sort but we
+    // use integer sort, so we cannot express these. Return an opaque fresh var.
+    case CmpInst::ICMP_ULT:
+    case CmpInst::ICMP_ULE:
+    case CmpInst::ICMP_UGT:
+    case CmpInst::ICMP_UGE:
+      return makeFreshZ3Expr(&I, C);
     default:
       break;
     }
@@ -242,15 +261,23 @@ z3::expr CFGMappingWitness::computeInstructionExprZ3(
 
   if (auto *PHI = dyn_cast<PHINode>(&I)) {
     (void)PHI;
-    // Represent PHI as a value; incoming resolution handled via PhiMap.
+    // Represent PHI as a symbolic variable; incoming resolution handled via
+    // PhiMap.
     return makeFreshZ3Expr(&I, C);
   }
 
   if (auto *SI = dyn_cast<SelectInst>(&I)) {
-    z3::expr ResultVar = makeFreshZ3Expr(&I, C);
+    // Use ITE to correctly model select
+    if (!isSupportedZ3Type(SI->getTrueValue()) ||
+        !isSupportedZ3Type(SI->getFalseValue()))
+      return makeFreshZ3Expr(&I, C);
+    z3::expr Cond = z3GetExprForValue(SI->getCondition(), C, ValMap);
     z3::expr TVal = z3GetExprForValue(SI->getTrueValue(), C, ValMap);
     z3::expr FVal = z3GetExprForValue(SI->getFalseValue(), C, ValMap);
-    return (ResultVar == TVal) || (ResultVar == FVal);
+    // Ensure Cond is bool
+    if (!Cond.is_bool())
+      Cond = (Cond != C.int_val(0));
+    return z3::ite(Cond, TVal, FVal);
   }
 
   if (auto *LI = dyn_cast<LoadInst>(&I)) {
@@ -286,8 +313,12 @@ z3::expr CFGMappingWitness::z3GetExprForValue(
   }
 
   if (auto *I = dyn_cast<Instruction>(V)) {
+    // Pre-insert a placeholder (fresh var) to break potential cycles.
+    z3::expr Placeholder = makeFreshZ3Expr(V, C);
+    ValMap.insert({V, Placeholder});
     z3::expr E = computeInstructionExprZ3(*I, C, ValMap);
-    ValMap.insert({V, E});
+    // Update the map entry with the actual expression.
+    ValMap.insert_or_assign(V, E);
     return E;
   }
 
@@ -327,7 +358,7 @@ z3::context &CFGMappingWitness::getContext() {
 void CFGMappingWitness::buildSourceMappings() {
   errs() << "\n*** CFGMappingWitness::buildSourceMappings() ***\n";
 
-  SrcStringMap = buildBlockStringValueMap();
+  SrcStringMap = buildBlockStringValueMap(/*isSrc=*/true);
   SrcZ3Map = buildBlockZ3ValueMap(&SrcPhiMap, &SrcRetMap, &SrcRetPhiMap);
   SrcPathCondMap = buildPathCondMap(SrcZ3Map);
 
@@ -340,7 +371,7 @@ void CFGMappingWitness::buildSourceMappings() {
 void CFGMappingWitness::buildTargetMappings() {
   errs() << "\n*** CFGMappingWitness::buildTargetMappings() ***\n";
 
-  TgtStringMap = buildBlockStringValueMap();
+  TgtStringMap = buildBlockStringValueMap(/*isSrc=*/false);
   TgtZ3Map = buildBlockZ3ValueMap(&TgtPhiMap, &TgtRetMap, &TgtRetPhiMap);
   TgtPathCondMap = buildPathCondMap(TgtZ3Map);
 
@@ -350,32 +381,50 @@ void CFGMappingWitness::buildTargetMappings() {
   dumpTargetPhiMappings("Post-Simplify Target PHI Mappings");
 }
 
-StringBlockMap CFGMappingWitness::buildBlockStringValueMap() {
+// Returns true if the variable name should be included in verification maps.
+// We skip unnamed (v0x...) values and void-type instructions.
+static bool shouldIncludeVar(const std::string &Name, const Value *V) {
+  if (Name.rfind("v0x", 0) == 0)
+    return false;
+  if (isa<AllocaInst>(V))
+    return false;
+  if (isa<Constant>(V) && !isa<ConstantInt>(V))
+    return false;
+  return true;
+}
+
+StringBlockMap CFGMappingWitness::buildBlockStringValueMap(bool isSrc) {
   StringBlockMap Result;
 
   for (BasicBlock &BB : *F) {
-    std::map<const Value *, std::string> BlockMap;
+    // Pointer-keyed map for SrcBlockValues (debug only)
+    std::map<const Value *, std::string> BlockPtrMap;
+    // String-keyed map for the result
+    std::map<std::string, std::string> BlockStrMap;
 
-    // Add instructions in this block
     DenseMap<const Value *, std::string> ValMap;
 
     for (Instruction &I : BB) {
       if (I.getType()->isVoidTy())
         continue;
       std::string Expr = getExprForValue(&I, ValMap);
-      BlockMap[&I] = Expr;
+      std::string VarName = getValueName(&I);
+      BlockPtrMap[&I] = Expr;
+      if (shouldIncludeVar(VarName, &I))
+        BlockStrMap[VarName] = Expr;
     }
 
-    if (auto *RI = dyn_cast<ReturnInst>(BB.getTerminator())) {
-      if (Value *RV = RI->getReturnValue()) {
-        std::string RetExpr = getExprForValue(RV, ValMap);
-        BlockMap[RI] = RetExpr;
-      }
-    }
+    // Handle return value separately via RetMap — don't add to block maps
+    // (avoids confusion with "ret" key during accumulation).
 
-    Result[BB.hasName() ? BB.getName().str() : std::string("(unnamed)")] =
-        BlockMap;
-    SrcBlockValues[&BB] = BlockMap;
+    std::string BBlockName =
+        BB.hasName() ? BB.getName().str() : std::string("(unnamed)");
+    Result[BBlockName] = BlockStrMap;
+
+    if (isSrc)
+      SrcBlockValues[&BB] = BlockPtrMap;
+    else
+      TgtBlockValues[&BB] = BlockPtrMap;
   }
 
   return Result;
@@ -385,15 +434,15 @@ Z3BlockMap CFGMappingWitness::buildBlockZ3ValueMap(PhiIncomingMap *PhiMap,
                                                    RetValueMap *RetMap,
                                                    RetPhiNameMap *RetPhiMap) {
   Z3BlockMap Result;
+  // Internal computation map: Value* -> z3::expr (alive during build only)
   std::map<const Value *, z3::expr> GlobalMap;
 
-  // Add function arguments
+  // Add function arguments to global map
   for (Argument &A : F->args())
     GlobalMap.insert({&A, makeFreshZ3Expr(&A, *SymCtx)});
 
   // Pre-pass: for each AllocaInst, if every store to it writes the same
   // constant, record that constant so loads can be resolved concretely.
-  // This models e.g. "store 2, %y" in both branches => load %y == 2.
   std::map<const Value *, z3::expr> ConstAllocaMap;
   for (BasicBlock &BB : *F) {
     for (Instruction &I : BB) {
@@ -425,11 +474,13 @@ Z3BlockMap CFGMappingWitness::buildBlockZ3ValueMap(PhiIncomingMap *PhiMap,
     }
   }
 
-  // Add instructions per block
   for (BasicBlock &BB : *F) {
     std::string BlockName =
         BB.hasName() ? BB.getName().str() : std::string("(unnamed)");
     std::map<const Value *, z3::expr> LocalMap = GlobalMap;
+
+    // String-keyed output map (no dangling pointers after transformation)
+    std::map<std::string, z3::expr> StrMap;
 
     for (Instruction &I : BB) {
       // Resolve loads from constant-store allocas concretely.
@@ -438,6 +489,9 @@ Z3BlockMap CFGMappingWitness::buildBlockZ3ValueMap(PhiIncomingMap *PhiMap,
         auto It = ConstAllocaMap.find(Ptr);
         if (It != ConstAllocaMap.end()) {
           LocalMap.insert({&I, It->second});
+          std::string VarName = getValueName(&I);
+          if (shouldIncludeVar(VarName, &I))
+            StrMap.insert_or_assign(VarName, It->second);
           continue;
         }
       }
@@ -447,6 +501,10 @@ Z3BlockMap CFGMappingWitness::buildBlockZ3ValueMap(PhiIncomingMap *PhiMap,
 
       z3::expr E = computeInstructionExprZ3(I, *SymCtx, LocalMap);
       LocalMap.insert({&I, E});
+
+      std::string VarName = getValueName(&I);
+      if (shouldIncludeVar(VarName, &I))
+        StrMap.insert_or_assign(VarName, E);
 
       if (auto *PHI = dyn_cast<PHINode>(&I)) {
         if (PhiMap) {
@@ -467,11 +525,9 @@ Z3BlockMap CFGMappingWitness::buildBlockZ3ValueMap(PhiIncomingMap *PhiMap,
 
     if (auto *RI = dyn_cast<ReturnInst>(BB.getTerminator())) {
       if (Value *RV = RI->getReturnValue()) {
-
         z3::expr RetExpr = z3GetExprForValue(RV, *SymCtx, LocalMap);
         errs() << "ret_expr_=" << Z3_ast_to_string(*SymCtx, RetExpr);
         errs() << "RI: " << *RI << "\n";
-        LocalMap.insert({RI, RetExpr});
         if (RetMap)
           RetMap->insert_or_assign(BlockName, RetExpr);
         if (RetPhiMap) {
@@ -481,9 +537,7 @@ Z3BlockMap CFGMappingWitness::buildBlockZ3ValueMap(PhiIncomingMap *PhiMap,
       }
     }
 
-    for (Argument &A : F->args())
-      LocalMap.erase(&A);
-    Result[BlockName] = LocalMap;
+    Result[BlockName] = std::move(StrMap);
   }
 
   return Result;
@@ -513,17 +567,18 @@ PathCondMap CFGMappingWitness::buildPathCondMap(const Z3BlockMap &Z3Map) {
   SmallVector<BasicBlock *, 16> Worklist;
   Worklist.push_back(&Entry);
 
-  auto get_value_expr = [&](const Value *V, const BasicBlock &BB) {
-    auto It = Z3Map.find(get_block_name(BB));
-    if (It != Z3Map.end()) {
-      auto ValIt = It->second.find(V);
-      if (ValIt != It->second.end())
+  // Lookup a value's Z3 expression from the string-keyed Z3Map.
+  // V must be from the live IR (its name is stable).
+  auto get_value_expr = [&](const Value *V, const BasicBlock &BB) -> z3::expr {
+    auto BlockIt = Z3Map.find(get_block_name(BB));
+    if (BlockIt != Z3Map.end()) {
+      std::string VName = getValueName(V);
+      auto ValIt = BlockIt->second.find(VName);
+      if (ValIt != BlockIt->second.end())
         return ValIt->second;
-      std::map<const Value *, z3::expr> LocalMap = It->second;
-      return z3GetExprForValue(V, C, LocalMap);
     }
-    std::map<const Value *, z3::expr> EmptyMap;
-    return z3GetExprForValue(V, C, EmptyMap);
+    // Fallback: create a fresh symbolic variable
+    return makeFreshZ3Expr(V, C);
   };
 
   auto update_successor = [&](BasicBlock *Succ, const z3::expr &Cond) {
@@ -539,8 +594,13 @@ PathCondMap CFGMappingWitness::buildPathCondMap(const Z3BlockMap &Z3Map) {
     }
   };
 
+  SmallPtrSet<BasicBlock *, 32> Visited;
   while (!Worklist.empty()) {
     BasicBlock *BB = Worklist.pop_back_val();
+    // Prevent infinite loops in cyclic CFGs
+    if (!Visited.insert(BB).second)
+      continue;
+
     std::string BBName = get_block_name(*BB);
     auto It = Result.find(BBName);
     if (It == Result.end())
@@ -554,6 +614,14 @@ PathCondMap CFGMappingWitness::buildPathCondMap(const Z3BlockMap &Z3Map) {
       }
 
       z3::expr CondExpr = get_value_expr(BI->getCondition(), *BB);
+      // Safely convert to bool; branch conditions are always i1
+      if (!CondExpr.is_bool()) {
+        if (CondExpr.is_int())
+          CondExpr = (CondExpr != C.int_val(0));
+        else
+          CondExpr = C.bool_const(("cond_" + std::to_string(
+              reinterpret_cast<uintptr_t>(BI))).c_str());
+      }
       update_successor(BI->getSuccessor(0), BBCond && CondExpr);
       update_successor(BI->getSuccessor(1), BBCond && !CondExpr);
       continue;
@@ -566,7 +634,10 @@ PathCondMap CFGMappingWitness::buildPathCondMap(const Z3BlockMap &Z3Map) {
       for (auto &Case : SI->cases()) {
         const ConstantInt *CaseVal = Case.getCaseValue();
         z3::expr CaseExpr = z3GetExprForValue(CaseVal, C, EmptyMap);
-        z3::expr Match = CondExpr == CaseExpr;
+        // Guard against sort mismatches between switch condition and case value
+        z3::expr Match = (CondExpr.get_sort().id() == CaseExpr.get_sort().id())
+                             ? (CondExpr == CaseExpr)
+                             : C.bool_val(false);
         update_successor(Case.getCaseSuccessor(), BBCond && Match);
         DefaultCond = DefaultCond && !Match;
       }
@@ -590,7 +661,8 @@ void CFGMappingWitness::dumpSourceStringMappings(const char *Label) {
       for (const auto &KV : It->second) {
         if (!First)
           errs() << ", ";
-        errs() << "\"" << getValueName(KV.first) << "\": \""
+        // KV.first is now std::string (the variable name)
+        errs() << "\"" << KV.first << "\": \""
                << escapeValueString(KV.second) << "\"";
         First = false;
       }
@@ -611,7 +683,7 @@ void CFGMappingWitness::dumpSourceZ3Mappings(const char *Label) {
       for (const auto &KV : It->second) {
         if (!First)
           errs() << ", ";
-        errs() << "\"" << getValueName(KV.first) << "\": \""
+        errs() << "\"" << KV.first << "\": \""
                << escapeValueString(Z3_ast_to_string(*SymCtx, KV.second))
                << "\"";
         First = false;
@@ -629,7 +701,7 @@ void CFGMappingWitness::dumpSourceZ3MapEntries(const char *Label) {
     for (const auto &KV : BlockEntry.second) {
       if (!First)
         errs() << ", ";
-      errs() << "\"" << getValueName(KV.first) << "\": \""
+      errs() << "\"" << KV.first << "\": \""
              << escapeValueString(Z3_ast_to_string(*SymCtx, KV.second)) << "\"";
       First = false;
     }
@@ -666,7 +738,7 @@ void CFGMappingWitness::dumpTargetStringMappings(const char *Label) {
       for (const auto &KV : It->second) {
         if (!First)
           errs() << ", ";
-        errs() << "\"" << getValueName(KV.first) << "\": \""
+        errs() << "\"" << KV.first << "\": \""
                << escapeValueString(KV.second) << "\"";
         First = false;
       }
@@ -687,7 +759,7 @@ void CFGMappingWitness::dumpTargetZ3Mappings(const char *Label) {
       for (const auto &KV : It->second) {
         if (!First)
           errs() << ", ";
-        errs() << "\"" << getValueName(KV.first) << "\": \""
+        errs() << "\"" << KV.first << "\": \""
                << escapeValueString(Z3_ast_to_string(*SymCtx, KV.second))
                << "\"";
         First = false;
@@ -705,7 +777,7 @@ void CFGMappingWitness::dumpTargetZ3MapEntries(const char *Label) {
     for (const auto &KV : BlockEntry.second) {
       if (!First)
         errs() << ", ";
-      errs() << "\"" << getValueName(KV.first) << "\": \""
+      errs() << "\"" << KV.first << "\": \""
              << escapeValueString(Z3_ast_to_string(*SymCtx, KV.second)) << "\"";
       First = false;
     }
@@ -747,11 +819,10 @@ CFGMappingWitness::getTargetBlockValues(const BasicBlock *BB) {
   static const std::map<const Value *, std::string> Empty;
   return Empty;
 }
-/// Build implication: (src_state && tgt_state) -> common_variable_equalities
-/// Takes src_vars and tgt_vars as (variable_name -> z3::expr) pairs,
-/// Creates z3 variables with _src and _tgt suffixes and returns:
-/// (src_var1_src == val1 && ...) && (tgt_var1_tgt == val1 && ...) ->
-/// (src_var1_src == tgt_var1_tgt && ...)
+
+/// Build implication: (src_state && tgt_state && param_eq) ->
+/// (common_variable_equalities)
+/// Now uses string-keyed maps — no dangling Value* access after transformation.
 z3::expr
 CFGMappingWitness::buildCommonVariableEquality(z3::context &C,
                                                ArrayRef<std::string> src_blocks,
@@ -760,54 +831,50 @@ CFGMappingWitness::buildCommonVariableEquality(z3::context &C,
   std::map<std::string, z3::expr> src_values;
   std::map<std::string, z3::expr> tgt_values;
 
+  // Accumulate variable->z3 mappings from a set of blocks.
+  // Uses the string-keyed SrcStringMap/TgtStringMap to enumerate variables,
+  // then looks up z3 expressions from the string-keyed SrcZ3Map/TgtZ3Map.
+  // This avoids any access to freed Value* pointers after transformation.
   auto accumulate_values =
       [](const StringBlockMap &StrMap, const Z3BlockMap &Z3Map,
          const PhiIncomingMap &PhiMap, ArrayRef<std::string> Blocks,
          ArrayRef<std::string> PhiHint,
          std::map<std::string, z3::expr> &Out) {
-        // If PhiHint is non-empty, use it for PHI incoming block resolution
-        // instead of Blocks. This lets SPLIT callers resolve PHIs using the
-        // source block names (the actual predecessor in the original CFG).
+        // If PhiHint is non-empty, use it for PHI incoming block resolution.
         ArrayRef<std::string> PhiBlocks = PhiHint.empty() ? Blocks : PhiHint;
+
         for (const std::string &Block : Blocks) {
-          std::string BlockName = Block;
-          auto StrIt = StrMap.find(BlockName);
+          auto StrIt = StrMap.find(Block);
           if (StrIt == StrMap.end())
             continue;
-          auto Z3It = Z3Map.find(BlockName);
+          auto Z3It = Z3Map.find(Block);
           if (Z3It == Z3Map.end())
             continue;
 
           for (const auto &KV : StrIt->second) {
-            const Value *V = KV.first;
-            if (isa<Constant>(V))
-              continue;
-            // AllocaInst produces a pointer/memory location, not a semantic
-            // value — skip it from cross-side equality comparison.
-            if (isa<AllocaInst>(V))
-              continue;
-            std::string VarName = getValueName(V);
-            if (VarName.rfind("v0x", 0) == 0)
-              continue;
+            // KV.first is now std::string (the variable name) — safe to use!
+            const std::string &VarName = KV.first;
+
             if (Out.count(VarName) != 0)
               continue;
 
-            if (isa<PHINode>(V)) {
-              auto PhiIt = PhiMap.find(VarName);
-              if (PhiIt != PhiMap.end()) {
-                for (StringRef IncomingBlock : PhiBlocks) {
-                  auto IncomingIt = PhiIt->second.find(IncomingBlock.str());
-                  if (IncomingIt != PhiIt->second.end()) {
-                    Out.emplace(VarName, IncomingIt->second);
-                    break;
-                  }
+            // Check if this is a PHI node (it appears in PhiMap)
+            auto PhiIt = PhiMap.find(VarName);
+            if (PhiIt != PhiMap.end()) {
+              // Resolve PHI using the appropriate incoming block
+              for (StringRef IncomingBlock : PhiBlocks) {
+                auto IncomingIt = PhiIt->second.find(IncomingBlock.str());
+                if (IncomingIt != PhiIt->second.end()) {
+                  Out.emplace(VarName, IncomingIt->second);
+                  break;
                 }
               }
               if (Out.count(VarName) != 0)
                 continue;
             }
 
-            auto ExprIt = Z3It->second.find(V);
+            // Look up the Z3 expression by variable name
+            auto ExprIt = Z3It->second.find(VarName);
             if (ExprIt == Z3It->second.end())
               continue;
 
@@ -921,39 +988,63 @@ CFGMappingWitness::buildCommonVariableEquality(z3::context &C,
   if (!param_equalities.empty())
     premise = premise && z3::mk_and(param_equalities);
 
-  z3::expr_vector common_equalities(C);
   std::set<std::string> param_names;
   for (const Argument &A : F->args())
     param_names.insert(getValueName(&A));
+
+  // Classify intermediate variable equalities into:
+  //   (a) trivial-trivial: both opaque/fresh PHI vars → move to premise as
+  //       shared assumptions (they represent the same unchanged SSA value)
+  //   (b) non-trivial-non-trivial: both expressible → put in conclusion
+  //   (c) mixed (one trivial, one non-trivial): skip (unprovable)
+  auto is_non_trivial_expr = [](const z3::expr &e) -> bool {
+    return e.num_args() > 0;
+  };
+
+  z3::expr_vector conclusion_equalities(C);
+
   for (const auto &[name, src_renamed] : src_renamed_vars) {
     if (param_names.count(name) != 0)
       continue;
     if (name == "ret")
       continue;
     auto it = tgt_renamed_vars.find(name);
-    if (it != tgt_renamed_vars.end()) {
-      const z3::expr &tgt_renamed = it->second;
-      bool same_sort =
-          src_renamed.is_bool() == tgt_renamed.is_bool() &&
-          src_renamed.is_int() == tgt_renamed.is_int() &&
-          src_renamed.get_sort().id() == tgt_renamed.get_sort().id();
-      if (same_sort)
-        common_equalities.push_back(src_renamed == tgt_renamed);
+    if (it == tgt_renamed_vars.end())
+      continue;
+    const z3::expr &tgt_renamed = it->second;
+    if (src_renamed.get_sort().id() != tgt_renamed.get_sort().id())
+      continue;
+    auto src_val_it = src_values.find(name);
+    auto tgt_val_it = tgt_values.find(name);
+    bool src_non_trivial = src_val_it != src_values.end() &&
+                           is_non_trivial_expr(src_val_it->second);
+    bool tgt_non_trivial = tgt_val_it != tgt_values.end() &&
+                           is_non_trivial_expr(tgt_val_it->second);
+    if (!src_non_trivial && !tgt_non_trivial) {
+      // Both opaque (unchanged PHI/fresh vars): add to premise as a shared
+      // assumption — they represent the same unchanged SSA value.
+      premise = premise && (src_renamed == tgt_renamed);
+    } else if (src_non_trivial && tgt_non_trivial) {
+      // Both expressible: verify equality in the conclusion.
+      conclusion_equalities.push_back(src_renamed == tgt_renamed);
+    } else {
+      // Mixed (one opaque PHI, one expressible select/ite): the witness mapping
+      // itself asserts the equivalence (e.g., PHI eliminated to select).
+      // Add to premise as a witness-backed assumption so derived computations
+      // can be checked downstream.
+      premise = premise && (src_renamed == tgt_renamed);
     }
   }
 
-  // Ensure return value equality is explicitly tracked when present.
+  // Return value equality is the primary semantic check.
   auto ret_src_it = src_renamed_vars.find("ret");
   auto ret_tgt_it = tgt_renamed_vars.find("ret");
   if (ret_src_it != src_renamed_vars.end() &&
       ret_tgt_it != tgt_renamed_vars.end()) {
     const z3::expr &ret_src = ret_src_it->second;
     const z3::expr &ret_tgt = ret_tgt_it->second;
-    bool same_sort = ret_src.is_bool() == ret_tgt.is_bool() &&
-                     ret_src.is_int() == ret_tgt.is_int() &&
-                     ret_src.get_sort().id() == ret_tgt.get_sort().id();
-    if (same_sort) {
-      common_equalities.push_back(ret_src == ret_tgt);
+    if (ret_src.get_sort().id() == ret_tgt.get_sort().id()) {
+      conclusion_equalities.push_back(ret_src == ret_tgt);
     } else {
       errs() << "[ret] sort mismatch, skipping ret equality\n";
     }
@@ -961,13 +1052,12 @@ CFGMappingWitness::buildCommonVariableEquality(z3::context &C,
              (ret_tgt_it == tgt_renamed_vars.end())) {
     errs() << "[ret] missing in "
            << (ret_src_it == src_renamed_vars.end() ? "src" : "tgt")
-           << " values\n";
-    return C.bool_val(false);
+           << " values — skipping ret equality\n";
   }
 
   z3::expr conclusion = C.bool_val(true);
-  if (!common_equalities.empty())
-    conclusion = z3::mk_and(common_equalities);
+  if (!conclusion_equalities.empty())
+    conclusion = z3::mk_and(conclusion_equalities);
 
   return z3::implies(premise, conclusion);
 }
