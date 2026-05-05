@@ -17,6 +17,9 @@ add_llvm_pass_plugin(WitnessPasses
   src/SimplifyCFGWitness.cpp
   src/SimplifyCFGUtils.cpp
   src/CFGMappingWitness.cpp
+  src/GVNMappingWitness.cpp
+  src/GVNWitnessPass.cpp
+  src/GVNLocal.cpp
 )
 include_directories(${LLVM_INCLUDE_DIRS})
 add_definitions(${LLVM_DEFINITIONS})

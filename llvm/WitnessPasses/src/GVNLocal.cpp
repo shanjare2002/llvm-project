@@ -1,5 +1,14 @@
 #include "GVNLocal.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/Value.h"
+// Records every value replacement GVN makes: (old_name, new_name).
 std::vector<std::pair<std::string, std::string>> GVNReplacements;
+
+// Records every critical-edge split GVN performs for PRE.
+// Each entry is (pred_block_name, new_intermediate_block_name).
+// The new block sits between pred and its original successor; it carries
+// the PRE-inserted computation and feeds the PHI at the successor.
+std::vector<std::pair<std::string, std::string>> GVNCFGChanges;
 static std::string getValueNameLocal(const llvm::Value *V) {
   if (const auto *CI = llvm::dyn_cast<llvm::ConstantInt>(V))
     return std::to_string(CI->getSExtValue());
@@ -2808,6 +2817,16 @@ bool GVNPass::processInstruction(Instruction *I) {
   // Allocations are always uniquely numbered, so we can save time and memory
   // by fast failing them.
   if (isa<AllocaInst>(I) || I->isTerminator() || isa<PHINode>(I)) {
+    // For PHI nodes: if this value number already has a leader, the PHI is
+    // redundant.  Record the replacement so the witness pass can use it as
+    // an equality premise.
+    if (isa<PHINode>(I) && Num < NextNum) {
+      if (Value *Leader = findLeader(I->getParent(), Num)) {
+        if (Leader != I)
+          GVNReplacements.push_back(
+              {getValueNameLocal(I), getValueNameLocal(Leader)});
+      }
+    }
     LeaderTable.insert(Num, I, I->getParent());
     return false;
   }
@@ -3190,6 +3209,13 @@ BasicBlock *GVNPass::splitCriticalEdges(BasicBlock *Pred, BasicBlock *Succ) {
     if (MD)
       MD->invalidateCachedPredecessors();
     InvalidBlockRPONumbers = true;
+    // Record the CFG change for witness verification: Pred's edge to Succ was
+    // split through the new intermediate block BB.
+    std::string PredName =
+        Pred->hasName() ? Pred->getName().str() : std::string("(unnamed)");
+    std::string BBName =
+        BB->hasName() ? BB->getName().str() : std::string("(unnamed)");
+    GVNCFGChanges.push_back({PredName, BBName});
   }
   return BB;
 }

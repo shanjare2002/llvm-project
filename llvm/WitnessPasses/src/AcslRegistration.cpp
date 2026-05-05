@@ -1,5 +1,6 @@
 #include "AcslDCE.h"
 #include "DSEWitnessPass.h"
+#include "GVNWitnessPass.h"
 #include "HelloWorld.h"
 #include "SimplifyCFGWitness.h"
 #include "llvm/ADT/StringRef.h"
@@ -36,6 +37,10 @@ llvmGetPassPluginInfo() {
                   }
                   if (Name == "dseWitness") {
                     FPM.addPass(DSEWitnessPass());
+                    return true;
+                  }
+                  if (Name == "gvn-witness") {
+                    FPM.addPass(GVNWitnessPass());
                     return true;
                   }
                   return false;
